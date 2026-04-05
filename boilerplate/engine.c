@@ -24,6 +24,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -127,6 +128,10 @@ typedef struct {
     pthread_mutex_t metadata_lock;
     container_record_t *containers;
 } supervisor_ctx_t;
+
+
+supervisor_ctx_t *supervisor_ctx = NULL;
+
 
 static void usage(const char *prog)
 {
@@ -406,6 +411,11 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
     return 0;
 }
 
+void stop_supervisor() {
+    if (supervisor_ctx == NULL) return;
+    supervisor_ctx->should_stop = 1;
+}
+
 /*
  * TODO:
  * Implement the long-running supervisor process.
@@ -419,9 +429,15 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
  */
 static int run_supervisor(const char *rootfs)
 {
+    if (supervisor_ctx != NULL) {
+        fprintf(stderr, "run_supervisor has been called more than once\n");
+        return 1;
+    }
+
     supervisor_ctx_t ctx;
     int rc;
 
+    supervisor_ctx = &ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.server_fd = -1;
     ctx.monitor_fd = -1;
@@ -449,12 +465,71 @@ static int run_supervisor(const char *rootfs)
      *   4) spawn the logger thread
      *   5) enter the supervisor event loop
      */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
+
+    if (access(CONTROL_PATH, F_OK) == 0) {
+        fprintf(stderr, "A FIFO at %s already exists! Another supervisor might be running.\n", CONTROL_PATH);
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+
+    rc = mkfifo(CONTROL_PATH, 0600);
+    if (rc != 0) {
+        perror("mkfifo");
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+    rc = chmod(CONTROL_PATH, 0622);
+    if (rc != 0) {
+        perror("chmod");
+        fprintf(stderr, "Warning: Failed to add write permissions for %s\n", CONTROL_PATH);
+    }
+
+    ctx.server_fd = open(CONTROL_PATH, O_RDONLY | O_NONBLOCK);
+    if (ctx.server_fd == -1) {
+        perror("open");
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+
+    signal(SIGINT, stop_supervisor);
+    signal(SIGTERM, stop_supervisor);
+
+    control_request_t request_buffer;
+    ssize_t bytes_read;
+    while (!ctx.should_stop) {
+        bytes_read = read(ctx.server_fd, &request_buffer, sizeof(request_buffer));
+        if (bytes_read == -1) {
+            if (errno == EAGAIN) continue;
+            perror("read");
+            break;
+        }
+        if (bytes_read == 0) continue;
+        if (bytes_read != sizeof(request_buffer)) {
+            fprintf(stderr, "Received malformed request (%zd bytes)\n", bytes_read);
+            continue;
+        }
+
+        printf("Got command: %d\n", request_buffer.kind);
+    }
+
+    (void) rootfs;
+    close(ctx.server_fd);
+
+    rc = remove(CONTROL_PATH);
+    if (rc != 0) {
+        perror("remove");
+    }
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
-    return 1;
+    return rc;
 }
 
 /*
@@ -467,9 +542,21 @@ static int run_supervisor(const char *rootfs)
  */
 static int send_control_request(const control_request_t *req)
 {
-    (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
-    return 1;
+    int fd = open(CONTROL_PATH, O_WRONLY);
+    if (fd == -1) {
+        perror("open");
+        return 1;
+    }
+
+    ssize_t bytes_written = write(fd, req, sizeof(control_request_t));
+    if (bytes_written == -1) {
+        perror("write");
+        close(fd);
+        return 1;
+    }
+
+    close(fd);
+    return 0;
 }
 
 static int cmd_start(int argc, char *argv[])
