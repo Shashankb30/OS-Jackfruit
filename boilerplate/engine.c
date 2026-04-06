@@ -75,7 +75,14 @@ typedef struct container_record {
     unsigned long hard_limit_bytes;
     int exit_code;
     int exit_signal;
+
+    char rootfs[PATH_MAX];
+    char command[CHILD_COMMAND_LEN];
+    int nice_value;
+
+    int log_write_fd;
     char log_path[PATH_MAX];
+
     struct container_record *next;
 } container_record_t;
 
@@ -110,14 +117,6 @@ typedef struct {
     int status;
     char message[CONTROL_MESSAGE_LEN];
 } control_response_t;
-
-typedef struct {
-    char id[CONTAINER_ID_LEN];
-    char rootfs[PATH_MAX];
-    char command[CHILD_COMMAND_LEN];
-    int nice_value;
-    int log_write_fd;
-} child_config_t;
 
 typedef struct {
     int server_fd;
@@ -371,10 +370,24 @@ void *logging_thread(void *arg)
  *   - stdout / stderr redirected to the supervisor logging path
  *   - configured command executed inside the container
  */
-int child_fn(void *arg)
+void child_fn(const char *rootfs, const char *command, int pipe_fd[2], container_record_t *container)
 {
-    (void)arg;
-    return 1;
+    const char shell[] = "/bin/sh";
+    char shell_path[PATH_MAX + sizeof(shell)] = {0};
+    strncpy(shell_path, rootfs, PATH_MAX);
+    strcat(shell_path, shell);
+
+    close(pipe_fd[0]);
+    dup2(pipe_fd[1], STDOUT_FILENO);
+    dup2(pipe_fd[1], STDERR_FILENO);
+
+    container->host_pid = getpid();
+    container->started_at = time(NULL);
+    container->state = CONTAINER_RUNNING;
+
+    execl(shell_path, "/bin/sh", "-c", command, NULL);
+    perror("execl");
+    exit(1);
 }
 
 int register_with_monitor(int monitor_fd,
@@ -409,6 +422,57 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
         return -1;
 
     return 0;
+}
+
+void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
+    container_record_t *container = malloc(sizeof(container_record_t));
+    strncpy(container->id, request->container_id, CONTAINER_ID_LEN);
+    strncpy(container->rootfs, request->rootfs, PATH_MAX);
+    strncpy(container->command, request->command, CHILD_COMMAND_LEN);
+    container->nice_value = request->nice_value;
+    container->state = CONTAINER_STARTING;
+
+    int pipe_fd[2] = {-1};
+    int rc = pipe(pipe_fd);
+    if (rc != 0) {
+        perror("rc");
+        return;
+    }
+    container->log_write_fd = pipe_fd[0];
+
+    pthread_mutex_lock(&ctx->metadata_lock);
+    container->next = ctx->containers;
+    ctx->containers = container;
+    pthread_mutex_unlock(&ctx->metadata_lock);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_fn(request->rootfs, request->command, pipe_fd, container); // does not return
+    } else if (pid > 0) {
+        close(pipe_fd[1]);
+        printf("Started container %s with PID %d\n", container->id, pid);
+    } else {
+        perror("fork");
+
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+
+        // remove container
+        pthread_mutex_lock(&ctx->metadata_lock);
+        container_record_t *container_tmp = ctx->containers;
+        if (container_tmp == container) {
+            ctx->containers = NULL;
+        } else {
+            while (container_tmp->next != NULL && container_tmp->next != container) {
+                container_tmp = container_tmp->next;
+            }
+            if (container_tmp->next == container) {
+                container_tmp->next = container->next;
+            }
+        }
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        free(container);
+    }
 }
 
 void stop_supervisor() {
@@ -516,6 +580,9 @@ static int run_supervisor(const char *rootfs)
         }
 
         printf("Got command: %d\n", request_buffer.kind);
+        if (request_buffer.kind == CMD_START) {
+            start_container(&ctx, &request_buffer);
+        }
     }
 
     (void) rootfs;
@@ -529,6 +596,13 @@ static int run_supervisor(const char *rootfs)
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
+
+    while (ctx.containers != NULL) {
+        container_record_t *next = ctx.containers->next;
+        free(ctx.containers);
+        ctx.containers = next;
+    }
+
     return rc;
 }
 
