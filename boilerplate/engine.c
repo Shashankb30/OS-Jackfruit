@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
@@ -81,6 +82,7 @@ typedef struct container_record {
     int nice_value;
 
     int log_write_fd;
+    int log_file_fd;
     char log_path[PATH_MAX];
 
     struct container_record *next;
@@ -121,12 +123,19 @@ typedef struct {
 typedef struct {
     int server_fd;
     int monitor_fd;
+    int shutdown_pipe_fd; // used as a shutdown signal by closing on shutdown
     int should_stop;
     pthread_t logger_thread;
     bounded_buffer_t log_buffer;
     pthread_mutex_t metadata_lock;
     container_record_t *containers;
 } supervisor_ctx_t;
+
+typedef struct {
+    supervisor_ctx_t *ctx;
+    char container_id[CONTAINER_ID_LEN];
+    int log_fd;
+} log_capture_thread_args;
 
 
 supervisor_ctx_t *supervisor_ctx = NULL;
@@ -355,8 +364,30 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
-    return NULL;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t*) arg;
+
+    log_item_t log_item;
+    while (1) {
+        int rc = bounded_buffer_pop(&ctx->log_buffer, &log_item);
+        if (rc != 0) return NULL;
+
+        pthread_mutex_lock(&ctx->metadata_lock);
+        container_record_t *container = ctx->containers;
+        while (container != NULL && strncmp(log_item.container_id, container->id, sizeof(container->id)) != 0) {
+            container = container->next;
+        }
+        pthread_mutex_unlock(&ctx->metadata_lock);
+
+        if (container == NULL) {
+            fprintf(stderr, "Could not find container with id '%s'\n", container->id);
+            continue;
+        }
+
+        int bytes_written = write(container->log_file_fd, log_item.data, log_item.length);
+        if (bytes_written < 0) {
+            perror("write");
+        }
+    }
 }
 
 /*
@@ -380,6 +411,7 @@ void child_fn(const char *rootfs, const char *command, int pipe_fd[2], container
     close(pipe_fd[0]);
     dup2(pipe_fd[1], STDOUT_FILENO);
     dup2(pipe_fd[1], STDERR_FILENO);
+    close(pipe_fd[1]);
 
     container->host_pid = getpid();
     container->started_at = time(NULL);
@@ -424,6 +456,78 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
     return 0;
 }
 
+void *capture_container_log(void *arg) {
+    log_capture_thread_args *args = (log_capture_thread_args*) arg;
+
+    struct pollfd fds[2];
+    fds[0].events = POLLIN;
+    fds[0].fd = args->ctx->shutdown_pipe_fd;
+    fds[1].events = POLLIN;
+    fds[1].fd = args->log_fd;
+
+    log_item_t log_item;
+    strncpy(log_item.container_id, args->container_id, sizeof(log_item.container_id));
+
+    while (1) {
+        poll(fds, 2, -1);
+
+        if (fds[0].revents & POLLHUP) break; // shutdown signal
+
+        if (fds[1].revents & POLLHUP) {
+            pthread_mutex_lock(&args->ctx->metadata_lock);
+            container_record_t *container = args->ctx->containers;
+            while (container != NULL && container->log_write_fd != args->log_fd) {
+                container = container->next;
+            }
+            pthread_mutex_unlock(&args->ctx->metadata_lock);
+
+            if (container == NULL) {
+                fprintf(stderr, "Failed to find container with log write fd %d\n", args->log_fd);
+                break;
+            }
+
+            int status;
+            pid_t rpid = waitpid(container->host_pid, &status, 0);
+            close(container->log_file_fd);
+            if (rpid < 0) {
+                perror("waitpid");
+                break;
+            }
+
+            if (WIFEXITED(status)) {
+                container->exit_code = WEXITSTATUS(status);
+                container->state = CONTAINER_EXITED;
+                printf("Container '%s' exited with code %d\n", container->id, container->exit_code);
+            } else if (WIFSIGNALED(status)) {
+                container->exit_code = WTERMSIG(status);
+                container->state = CONTAINER_STOPPED;
+                printf("Container '%s' was terminated by signal %d\n", container->id, container->exit_code);
+            } else {
+                fprintf(stderr, "Container '%s' is in unknown state: %d\n", container->id, status);
+                container->exit_code = -1;
+                container->state = CONTAINER_STOPPED;
+            }
+
+            break;
+        }
+
+        if (fds[1].revents & POLLIN) {
+            int bytes_read = read(fds[1].fd, &log_item.data[log_item.length], sizeof(log_item.data) - log_item.length);
+            if (bytes_read < 0) {
+                perror("read");
+                break;
+            }
+
+            log_item.length = bytes_read;
+            bounded_buffer_push(&args->ctx->log_buffer, &log_item);
+        }
+    }
+
+    close(args->log_fd);
+    free(args);
+    return NULL;
+}
+
 void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     container_record_t *container = malloc(sizeof(container_record_t));
     strncpy(container->id, request->container_id, CONTAINER_ID_LEN);
@@ -440,10 +544,32 @@ void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     }
     container->log_write_fd = pipe_fd[0];
 
+    snprintf(container->log_path, sizeof(container->log_path), "/tmp/%s.log", container->id);
+    container->log_file_fd = open(container->log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (container->log_file_fd < 0) {
+        perror("open");
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        free(container);
+        return;
+    }
+
     pthread_mutex_lock(&ctx->metadata_lock);
     container->next = ctx->containers;
     ctx->containers = container;
     pthread_mutex_unlock(&ctx->metadata_lock);
+
+    log_capture_thread_args *args = malloc(sizeof(log_capture_thread_args));
+    strncpy(args->container_id, container->id, sizeof(args->container_id));
+    args->ctx = ctx;
+    args->log_fd = pipe_fd[0];
+
+    pthread_t container_log_thread;
+    rc = pthread_create(&container_log_thread, NULL, capture_container_log, args);
+    if (rc != 0) {
+        fprintf(stderr, "Failed to create log capture thread for container %s\n", container->id);
+        goto fail_cleanup;
+    }
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -454,8 +580,10 @@ void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     } else {
         perror("fork");
 
+fail_cleanup:
         close(pipe_fd[0]);
         close(pipe_fd[1]);
+        free(args);
 
         // remove container
         pthread_mutex_lock(&ctx->metadata_lock);
@@ -530,6 +658,15 @@ static int run_supervisor(const char *rootfs)
      *   5) enter the supervisor event loop
      */
 
+    rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+    if (rc != 0) {
+        fprintf(stderr, "Failed to create logger thread. Error code: %d\n", rc);
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+
     if (access(CONTROL_PATH, F_OK) == 0) {
         fprintf(stderr, "A FIFO at %s already exists! Another supervisor might be running.\n", CONTROL_PATH);
         bounded_buffer_begin_shutdown(&ctx.log_buffer);
@@ -560,6 +697,17 @@ static int run_supervisor(const char *rootfs)
         pthread_mutex_destroy(&ctx.metadata_lock);
         return 1;
     }
+
+    int shutdown_fds[2];
+    rc = pipe(shutdown_fds);
+    if (rc != 0) {
+        perror("pipe");
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+    ctx.shutdown_pipe_fd = shutdown_fds[0];
 
     signal(SIGINT, stop_supervisor);
     signal(SIGTERM, stop_supervisor);
@@ -592,6 +740,8 @@ static int run_supervisor(const char *rootfs)
     if (rc != 0) {
         perror("remove");
     }
+
+    close(shutdown_fds[1]); // sends shutdown signal to logging threads
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
