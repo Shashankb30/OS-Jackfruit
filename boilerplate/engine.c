@@ -123,8 +123,7 @@ typedef struct {
 typedef struct {
     int server_fd;
     int monitor_fd;
-    int shutdown_pipe_fd; // used as a shutdown signal by closing on shutdown
-    int should_stop;
+    int shutdown_pipe_fds[2]; // used as a shutdown signal
     pthread_t logger_thread;
     bounded_buffer_t log_buffer;
     pthread_mutex_t metadata_lock;
@@ -135,8 +134,12 @@ typedef struct {
     supervisor_ctx_t *ctx;
     char container_id[CONTAINER_ID_LEN];
     int log_fd;
-} log_capture_thread_args;
+} log_capture_thread_args_t;
 
+typedef struct {
+    supervisor_ctx_t *ctx;
+    int client_fd;
+} client_handler_thread_args_t;
 
 supervisor_ctx_t *supervisor_ctx = NULL;
 
@@ -457,11 +460,11 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
 }
 
 void *capture_container_log(void *arg) {
-    log_capture_thread_args *args = (log_capture_thread_args*) arg;
+    log_capture_thread_args_t *args = (log_capture_thread_args_t*) arg;
 
     struct pollfd fds[2];
     fds[0].events = POLLIN;
-    fds[0].fd = args->ctx->shutdown_pipe_fd;
+    fds[0].fd = args->ctx->shutdown_pipe_fds[0];
     fds[1].events = POLLIN;
     fds[1].fd = args->log_fd;
 
@@ -469,9 +472,14 @@ void *capture_container_log(void *arg) {
     strncpy(log_item.container_id, args->container_id, sizeof(log_item.container_id));
 
     while (1) {
-        poll(fds, 2, -1);
+        int n = poll(fds, 2, -1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
 
-        if (fds[0].revents & POLLHUP) break; // shutdown signal
+        if (fds[0].revents & (POLLIN | POLLHUP)) break; // shutdown signal
 
         if (fds[1].revents & POLLHUP) {
             pthread_mutex_lock(&args->ctx->metadata_lock);
@@ -559,7 +567,7 @@ void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     ctx->containers = container;
     pthread_mutex_unlock(&ctx->metadata_lock);
 
-    log_capture_thread_args *args = malloc(sizeof(log_capture_thread_args));
+    log_capture_thread_args_t *args = malloc(sizeof(log_capture_thread_args_t));
     strncpy(args->container_id, container->id, sizeof(args->container_id));
     args->ctx = ctx;
     args->log_fd = pipe_fd[0];
@@ -603,9 +611,54 @@ fail_cleanup:
     }
 }
 
+void *handle_client(void *arg) {
+    client_handler_thread_args_t *args = (client_handler_thread_args_t*) arg;
+    int client_fd = args->client_fd;
+
+    control_request_t request;
+    int rc = read(client_fd, (void*) &request, sizeof(request));
+    if (rc == -1) {
+        perror("read");
+        close(client_fd);
+        free(args);
+        return NULL;
+    }
+
+    switch (request.kind) {
+        case CMD_SUPERVISOR:
+            fprintf(stderr, "Received request of type 'CMD_SUPERVISOR'\n");
+            break;
+        case CMD_START:
+            start_container(args->ctx, &request);
+            break;
+        case CMD_RUN:
+            printf("Received run request\n");
+            break;
+        case CMD_PS:
+            printf("Received ps request\n");
+            break;
+        case CMD_LOGS:
+            printf("Received logs request\n");
+            break;
+        case CMD_STOP:
+            printf("Received stop request\n");
+            break;
+        default:
+            fprintf(stderr, "Received unknown request type: %d\n", request.kind);
+            break;
+    }
+
+    close(client_fd);
+    free(args);
+    return NULL;
+}
+
 void stop_supervisor() {
     if (supervisor_ctx == NULL) return;
-    supervisor_ctx->should_stop = 1;
+    int rc = write(supervisor_ctx->shutdown_pipe_fds[1], "stop", 5);
+    if (rc == -1) {
+        perror("write");
+    }
 }
 
 /*
@@ -667,81 +720,102 @@ static int run_supervisor(const char *rootfs)
         return 1;
     }
 
-    if (access(CONTROL_PATH, F_OK) == 0) {
-        fprintf(stderr, "A FIFO at %s already exists! Another supervisor might be running.\n", CONTROL_PATH);
-        bounded_buffer_begin_shutdown(&ctx.log_buffer);
-        bounded_buffer_destroy(&ctx.log_buffer);
-        pthread_mutex_destroy(&ctx.metadata_lock);
-        return 1;
-    }
-
-    rc = mkfifo(CONTROL_PATH, 0600);
-    if (rc != 0) {
-        perror("mkfifo");
-        bounded_buffer_begin_shutdown(&ctx.log_buffer);
-        bounded_buffer_destroy(&ctx.log_buffer);
-        pthread_mutex_destroy(&ctx.metadata_lock);
-        return 1;
-    }
-    rc = chmod(CONTROL_PATH, 0622);
-    if (rc != 0) {
-        perror("chmod");
-        fprintf(stderr, "Warning: Failed to add write permissions for %s\n", CONTROL_PATH);
-    }
-
-    ctx.server_fd = open(CONTROL_PATH, O_RDONLY | O_NONBLOCK);
+    ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ctx.server_fd == -1) {
-        perror("open");
+        perror("socket");
         bounded_buffer_begin_shutdown(&ctx.log_buffer);
         bounded_buffer_destroy(&ctx.log_buffer);
         pthread_mutex_destroy(&ctx.metadata_lock);
         return 1;
     }
 
-    int shutdown_fds[2];
-    rc = pipe(shutdown_fds);
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path));
+
+    rc = bind(ctx.server_fd, (struct sockaddr*) &addr, sizeof(addr));
+    if (rc == -1) {
+        perror("bind");
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+
+    rc = listen(ctx.server_fd, 10);
+    if (rc == -1) {
+        perror("listen");
+        close(ctx.server_fd);
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+    printf("Listening for requests\n");
+
+    rc = pipe(ctx.shutdown_pipe_fds);
     if (rc != 0) {
         perror("pipe");
+        unlink(CONTROL_PATH);
+        close(ctx.server_fd);
         bounded_buffer_begin_shutdown(&ctx.log_buffer);
         bounded_buffer_destroy(&ctx.log_buffer);
         pthread_mutex_destroy(&ctx.metadata_lock);
         return 1;
     }
-    ctx.shutdown_pipe_fd = shutdown_fds[0];
 
     signal(SIGINT, stop_supervisor);
     signal(SIGTERM, stop_supervisor);
 
-    control_request_t request_buffer;
-    ssize_t bytes_read;
-    while (!ctx.should_stop) {
-        bytes_read = read(ctx.server_fd, &request_buffer, sizeof(request_buffer));
-        if (bytes_read == -1) {
-            if (errno == EAGAIN) continue;
-            perror("read");
+    struct pollfd pollfds[2];
+    pollfds[0].fd = ctx.shutdown_pipe_fds[0];
+    pollfds[0].events = POLLIN;
+
+    pollfds[1].fd = ctx.server_fd;
+    pollfds[1].events = POLLIN;
+
+    while (1) {
+        int n = poll(pollfds, 2, -1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
             break;
         }
-        if (bytes_read == 0) continue;
-        if (bytes_read != sizeof(request_buffer)) {
-            fprintf(stderr, "Received malformed request (%zd bytes)\n", bytes_read);
+
+        if (pollfds[0].revents & POLLIN) {
+            break;
+        }
+
+        if (!(pollfds[1].revents & POLLIN)) {
+            fprintf(stderr, "Unexpected event on server fd: %d\n", pollfds[1].revents);
+            break;
+        }
+
+        client_handler_thread_args_t *client_thread_args = malloc(sizeof(client_handler_thread_args_t));
+        client_thread_args->ctx = &ctx;
+        client_thread_args->client_fd = accept(ctx.server_fd, NULL, NULL);
+        if (client_thread_args->client_fd == -1) {
+            perror("accept");
+            free(client_thread_args);
             continue;
         }
 
-        printf("Got command: %d\n", request_buffer.kind);
-        if (request_buffer.kind == CMD_START) {
-            start_container(&ctx, &request_buffer);
+        pthread_t handler_thread;
+        rc = pthread_create(&handler_thread, NULL, handle_client, (void*) client_thread_args);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to spawn client handler thread. Error code: %d\n", rc);
+            close(client_thread_args->client_fd);
+            free(client_thread_args);
+            continue;
         }
     }
 
+    printf("\nStopping supervisor\n");
+
     (void) rootfs;
+    unlink(CONTROL_PATH);
     close(ctx.server_fd);
-
-    rc = remove(CONTROL_PATH);
-    if (rc != 0) {
-        perror("remove");
-    }
-
-    close(shutdown_fds[1]); // sends shutdown signal to logging threads
+    close(ctx.shutdown_pipe_fds[1]); // sends shutdown signal to logging threads
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
@@ -766,20 +840,31 @@ static int run_supervisor(const char *rootfs)
  */
 static int send_control_request(const control_request_t *req)
 {
-    int fd = open(CONTROL_PATH, O_WRONLY);
-    if (fd == -1) {
-        perror("open");
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        perror("socket");
         return 1;
     }
 
-    ssize_t bytes_written = write(fd, req, sizeof(control_request_t));
-    if (bytes_written == -1) {
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path));
+
+    int rc = connect(server_fd, (struct sockaddr*) &addr, sizeof(addr));
+    if (rc == -1) {
+        perror("connect");
+        close(server_fd);
+        return 1;
+    }
+
+    rc = write(server_fd, (const void*) req, sizeof(control_request_t));
+    if (rc == -1) {
         perror("write");
-        close(fd);
+        close(server_fd);
         return 1;
     }
 
-    close(fd);
+    close(server_fd);
     return 0;
 }
 
