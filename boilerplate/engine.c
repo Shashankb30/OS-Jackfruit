@@ -404,7 +404,7 @@ void *logging_thread(void *arg)
  *   - stdout / stderr redirected to the supervisor logging path
  *   - configured command executed inside the container
  */
-void child_fn(const char *rootfs, const char *command, int pipe_fd[2], container_record_t *container)
+void child_fn(const char *rootfs, const char *command, int pipe_fd[2])
 {
     const char shell[] = "/bin/sh";
     char shell_path[PATH_MAX + sizeof(shell)] = {0};
@@ -589,7 +589,6 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
         }
     }
 
-    time_t start = time(NULL);
     snprintf(container->log_path, sizeof(container->log_path), "%s/%s.log", LOG_DIR, container->id);
     container->log_file_fd = open(container->log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
     if (container->log_file_fd < 0) {
@@ -613,7 +612,7 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
 
     pid_t pid = fork();
     if (pid == 0) {
-        child_fn(request->rootfs, request->command, pipe_fd, container); // does not return
+        child_fn(request->rootfs, request->command, pipe_fd); // does not return
     } else if (pid > 0) {
         close(pipe_fd[1]);
         printf("Started container %s with PID %d\n", container->id, pid);
@@ -717,6 +716,9 @@ int get_container_logs(supervisor_ctx_t *ctx, const control_request_t *request, 
     size_t to_read = file_size - start;
     size_t read_bytes = fread(buf, 1, to_read, fp);
     fclose(fp);
+    if (read_bytes != to_read) {
+        return -1;
+    }
 
     return 0;
 }
