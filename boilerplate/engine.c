@@ -662,7 +662,15 @@ void get_containers_status(supervisor_ctx_t *ctx, char *buf, int n) {
     } else {
         while (container != NULL && len < n) {
             const char *state_str = state_to_string(container->state);
-            len += snprintf(buf + len, n - len, "%s: %s\n", container->id, state_str);
+            len += snprintf(buf + len, n - len, "%s (%s) - Start Time: %lu", container->id, state_str, container->started_at);
+            if (container->state == CONTAINER_RUNNING) {
+                len += snprintf(buf + len, n - len, ", PID: %d, Nice: %d", container->host_pid, container->nice_value);
+            } else if (container->state == CONTAINER_EXITED) {
+                len += snprintf(buf + len, n - len, ", Exit Code: %d", container->exit_code);
+            } else if (container->state == CONTAINER_STOPPED) {
+                len += snprintf(buf + len, n - len, ", Stop signal: %d", container->exit_code);
+            }
+            len += snprintf(buf + len, n - len, "\n");
             container = container->next;
         }
     }
