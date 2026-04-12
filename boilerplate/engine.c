@@ -660,13 +660,14 @@ void get_containers_status(supervisor_ctx_t *ctx, char *buf, int n) {
         snprintf(buf, n, "No containers yet.\n");
     } else {
         while (container != NULL && len < n) {
-            const char *state_str = state_to_string(container->state);
+            container_state_t state = container->state;
+            const char *state_str = state_to_string(state);
             len += snprintf(buf + len, n - len, "%s (%s) - Start Time: %lu", container->id, state_str, container->started_at);
-            if (container->state == CONTAINER_RUNNING) {
+            if (state == CONTAINER_RUNNING) {
                 len += snprintf(buf + len, n - len, ", PID: %d, Nice: %d", container->host_pid, container->nice_value);
-            } else if (container->state == CONTAINER_EXITED) {
+            } else if (state == CONTAINER_EXITED) {
                 len += snprintf(buf + len, n - len, ", Exit Code: %d", container->exit_code);
-            } else if (container->state == CONTAINER_STOPPED) {
+            } else if (state == CONTAINER_STOPPED) {
                 len += snprintf(buf + len, n - len, ", Stop signal: %d", container->exit_code);
             }
             len += snprintf(buf + len, n - len, "\n");
@@ -1067,17 +1068,6 @@ static int cmd_ps(void)
     memset(&req, 0, sizeof(req));
     req.kind = CMD_PS;
 
-    /*
-     * TODO:
-     * The supervisor should respond with container metadata.
-     * Keep the rendering format simple enough for demos and debugging.
-     */
-    printf("Expected states include: %s, %s, %s, %s, %s\n",
-           state_to_string(CONTAINER_STARTING),
-           state_to_string(CONTAINER_RUNNING),
-           state_to_string(CONTAINER_STOPPED),
-           state_to_string(CONTAINER_KILLED),
-           state_to_string(CONTAINER_EXITED));
     return send_control_request(&req);
 }
 
