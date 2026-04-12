@@ -536,8 +536,8 @@ void *capture_container_log(void *arg) {
     return NULL;
 }
 
-void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
-    __label__ fail_cleanup;
+int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
+    __label__ cleanup_pipe, cleanup_ctx_containers, cleanup_logger;
 
     container_record_t *container = malloc(sizeof(container_record_t));
     strncpy(container->id, request->container_id, CONTAINER_ID_LEN);
@@ -550,24 +550,57 @@ void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     int rc = pipe(pipe_fd);
     if (rc != 0) {
         perror("rc");
-        return;
+        free(container);
+        return -1;
     }
     container->log_write_fd = pipe_fd[0];
 
-    snprintf(container->log_path, sizeof(container->log_path), "/tmp/%s.log", container->id);
-    container->log_file_fd = open(container->log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (container->log_file_fd < 0) {
-        perror("open");
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        free(container);
-        return;
-    }
-
     pthread_mutex_lock(&ctx->metadata_lock);
+    container_record_t *tmp = ctx->containers;
+    container_record_t *prev = NULL;
+    while (tmp != NULL) {
+        if (strncmp(tmp->id, container->id, sizeof(container->id)) == 0) {
+            if (tmp->state == CONTAINER_RUNNING || tmp->state == CONTAINER_STARTING) {
+                pthread_mutex_unlock(&ctx->metadata_lock);
+                rc = 1;
+                goto cleanup_pipe;
+            } else {
+                if (prev != NULL) {
+                    prev->next = tmp->next;
+                } else {
+                    ctx->containers = NULL;
+                }
+                free(tmp);
+                break;
+            }
+        }
+        prev = tmp;
+        tmp = tmp->next;
+    }
     container->next = ctx->containers;
     ctx->containers = container;
     pthread_mutex_unlock(&ctx->metadata_lock);
+
+    // Create log directory if required
+    struct stat st = {0};
+    rc = stat(LOG_DIR, &st);
+    if (rc == -1) {
+        rc = mkdir(LOG_DIR, 0755);
+        if (rc == -1) {
+            perror("mkdir");
+            rc = -1;
+            goto cleanup_ctx_containers;
+        }
+    }
+
+    time_t start = time(NULL);
+    snprintf(container->log_path, sizeof(container->log_path), "%s/%s.log", LOG_DIR, container->id);
+    container->log_file_fd = open(container->log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (container->log_file_fd < 0) {
+        perror("open");
+        rc = -1;
+        goto cleanup_ctx_containers;
+    }
 
     log_capture_thread_args_t *args = malloc(sizeof(log_capture_thread_args_t));
     strncpy(args->container_id, container->id, sizeof(args->container_id));
@@ -578,7 +611,8 @@ void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     rc = pthread_create(&container_log_thread, NULL, capture_container_log, args);
     if (rc != 0) {
         fprintf(stderr, "Failed to create log capture thread for container %s\n", container->id);
-        goto fail_cleanup;
+        rc = -1;
+        goto cleanup_logger;
     }
 
     pid_t pid = fork();
@@ -587,30 +621,37 @@ void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     } else if (pid > 0) {
         close(pipe_fd[1]);
         printf("Started container %s with PID %d\n", container->id, pid);
-    } else {
-        perror("fork");
-
-fail_cleanup:
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        free(args);
-
-        // remove container
-        pthread_mutex_lock(&ctx->metadata_lock);
-        container_record_t *container_tmp = ctx->containers;
-        if (container_tmp == container) {
-            ctx->containers = NULL;
-        } else {
-            while (container_tmp->next != NULL && container_tmp->next != container) {
-                container_tmp = container_tmp->next;
-            }
-            if (container_tmp->next == container) {
-                container_tmp->next = container->next;
-            }
-        }
-        pthread_mutex_unlock(&ctx->metadata_lock);
-        free(container);
+        return 0;
     }
+
+    perror("fork");
+    rc = -1;
+
+cleanup_logger:
+    free(args);
+    close(container->log_file_fd);
+
+cleanup_ctx_containers:
+    // remove container
+    pthread_mutex_lock(&ctx->metadata_lock);
+    container_record_t *container_tmp = ctx->containers;
+    if (container_tmp == container) {
+        ctx->containers = NULL;
+    } else {
+        while (container_tmp->next != NULL && container_tmp->next != container) {
+            container_tmp = container_tmp->next;
+        }
+        if (container_tmp->next == container) {
+            container_tmp->next = container->next;
+        }
+    }
+    pthread_mutex_unlock(&ctx->metadata_lock);
+
+cleanup_pipe:
+    close(pipe_fd[0]);
+    close(pipe_fd[1]);
+    free(container);
+    return rc;
 }
 
 void *handle_client(void *arg) {
@@ -626,12 +667,27 @@ void *handle_client(void *arg) {
         return NULL;
     }
 
+    int send_response = 0;
+    control_response_t response;
+    memset(&response, 0, sizeof(response));
+
     switch (request.kind) {
         case CMD_SUPERVISOR:
             fprintf(stderr, "Received request of type 'CMD_SUPERVISOR'\n");
             break;
         case CMD_START:
-            start_container(args->ctx, &request);
+            rc = start_container(args->ctx, &request);
+            send_response = 1;
+            if (rc == 0) {
+                response.status = 201;
+                snprintf(response.message, sizeof(response.message), "Created container with id '%s'", request.container_id);
+            } else if (rc == 1) {
+                response.status = 400;
+                snprintf(response.message, sizeof(response.message), "Container with id '%s' already exists!", request.container_id);
+            } else {
+                response.status = 500;
+                snprintf(response.message, sizeof(response.message), "An internal error occurred.");
+            }
             break;
         case CMD_RUN:
             printf("Received run request\n");
@@ -648,6 +704,13 @@ void *handle_client(void *arg) {
         default:
             fprintf(stderr, "Received unknown request type: %d\n", request.kind);
             break;
+    }
+
+    if (send_response) {
+        rc = write(client_fd, (const void*) &response, sizeof(response));
+        if (rc == -1) {
+            perror("write");
+        }
     }
 
     close(client_fd);
@@ -851,6 +914,15 @@ static int send_control_request(const control_request_t *req)
         perror("write");
         close(server_fd);
         return 1;
+    }
+
+    control_response_t response;
+    rc = read(server_fd, (void*) &response, sizeof(response));
+    if (rc == -1) {
+        perror("read");
+    } else if (rc > 0) {
+        response.message[sizeof(response.message) - 1] = '\0';
+        printf("Status: %d\nMessage: %s\n", response.status, response.message);
     }
 
     close(server_fd);
