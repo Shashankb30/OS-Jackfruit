@@ -416,10 +416,6 @@ void child_fn(const char *rootfs, const char *command, int pipe_fd[2], container
     dup2(pipe_fd[1], STDERR_FILENO);
     close(pipe_fd[1]);
 
-    container->host_pid = getpid();
-    container->started_at = time(NULL);
-    container->state = CONTAINER_RUNNING;
-
     execl(shell_path, "/bin/sh", "-c", command, NULL);
     perror("execl");
     exit(1);
@@ -621,6 +617,9 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     } else if (pid > 0) {
         close(pipe_fd[1]);
         printf("Started container %s with PID %d\n", container->id, pid);
+        container->host_pid = pid;
+        container->started_at = time(NULL);
+        container->state = CONTAINER_RUNNING;
         return 0;
     }
 
