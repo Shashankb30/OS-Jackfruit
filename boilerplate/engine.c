@@ -724,6 +724,36 @@ int get_container_logs(supervisor_ctx_t *ctx, const control_request_t *request, 
     return 0;
 }
 
+int stop_container(supervisor_ctx_t *ctx, const char *container_id) {
+    pthread_mutex_lock(&ctx->metadata_lock);
+    container_record_t *container = ctx->containers;
+    if (container == NULL) {
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        return 1;
+    } else {
+        while (container != NULL) {
+            if (strncmp(container_id, container->id, sizeof(container->id)) == 0) {
+                pthread_mutex_unlock(&ctx->metadata_lock);
+
+                if (container->state != CONTAINER_RUNNING) {
+                    return 2;
+                }
+
+                int rc = kill(container->host_pid, SIGTERM);
+                if (rc == -1) {
+                    perror("kill");
+                    return -1;
+                }
+
+                return 0;
+            }
+            container = container->next;
+        }
+    }
+    pthread_mutex_unlock(&ctx->metadata_lock);
+    return 1;
+}
+
 void *handle_client(void *arg) {
     client_handler_thread_args_t *args = (client_handler_thread_args_t*) arg;
     int client_fd = args->client_fd;
@@ -781,7 +811,21 @@ void *handle_client(void *arg) {
             }
             break;
         case CMD_STOP:
-            printf("Received stop request\n");
+            rc = stop_container(args->ctx, request.container_id);
+            send_response = 1;
+            if (rc == 0) {
+                response.status = 200;
+                snprintf(response.message, sizeof(response.message), "Sent terminate signal to container '%s'", request.container_id);
+            } else if (rc == 1) {
+                response.status = 400;
+                snprintf(response.message, sizeof(response.message), "Container '%s' does not exist!", request.container_id);
+            } else if (rc == 2) {
+                response.status = 400;
+                snprintf(response.message, sizeof(response.message), "Could not send terminate signal. The container is not running.");
+            } else {
+                response.status = 500;
+                snprintf(response.message, sizeof(response.message), "An internal error occurred.");
+            }
             break;
         default:
             fprintf(stderr, "Received unknown request type: %d\n", request.kind);
