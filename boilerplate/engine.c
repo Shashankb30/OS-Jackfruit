@@ -677,6 +677,50 @@ void get_containers_status(supervisor_ctx_t *ctx, char *buf, int n) {
     pthread_mutex_unlock(&ctx->metadata_lock);
 }
 
+int get_container_logs(supervisor_ctx_t *ctx, const control_request_t *request, char *buf, int n) {
+    pthread_mutex_lock(&ctx->metadata_lock);
+    container_record_t *container = ctx->containers;
+    while (container != NULL) {
+        if (strncmp(request->container_id, container->id, sizeof(container->id)) == 0) {
+            break;
+        }
+        container = container->next;
+    }
+
+    if (container == NULL) {
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        return 1;
+    }
+    pthread_mutex_unlock(&ctx->metadata_lock);
+
+    FILE *fp = fopen(container->log_path, "rb");
+    if (!fp) return -1;
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    long file_size = ftell(fp);
+    if (file_size < 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    long start = (file_size > (long)n) ? file_size - (long)n : 0;
+
+    if (fseek(fp, start, SEEK_SET) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    size_t to_read = file_size - start;
+    size_t read_bytes = fread(buf, 1, to_read, fp);
+    fclose(fp);
+
+    return 0;
+}
+
 void *handle_client(void *arg) {
     client_handler_thread_args_t *args = (client_handler_thread_args_t*) arg;
     int client_fd = args->client_fd;
@@ -721,7 +765,17 @@ void *handle_client(void *arg) {
             get_containers_status(args->ctx, response.message, sizeof(response.message));
             break;
         case CMD_LOGS:
-            printf("Received logs request\n");
+            rc = get_container_logs(args->ctx, &request, response.message, sizeof(response.message));
+            send_response = 1;
+            if (rc == 0) {
+                response.status = 200;
+            } else if (rc == 1) {
+                response.status = 400;
+                snprintf(response.message, sizeof(response.message), "Container '%s' does not exist!", request.container_id);
+            } else {
+                response.status = 500;
+                snprintf(response.message, sizeof(response.message), "An internal error occurred.");
+            }
             break;
         case CMD_STOP:
             printf("Received stop request\n");
