@@ -537,6 +537,8 @@ void *capture_container_log(void *arg) {
 }
 
 void start_container(supervisor_ctx_t *ctx, control_request_t *request) {
+    __label__ fail_cleanup;
+
     container_record_t *container = malloc(sizeof(container_record_t));
     strncpy(container->id, request->container_id, CONTAINER_ID_LEN);
     strncpy(container->rootfs, request->rootfs, PATH_MAX);
@@ -674,6 +676,9 @@ void stop_supervisor() {
  */
 static int run_supervisor(const char *rootfs)
 {
+    __label__ cleanup_bounded_buffer, cleanup_socket;
+    (void) rootfs;
+
     if (supervisor_ctx != NULL) {
         fprintf(stderr, "run_supervisor has been called more than once\n");
         return 1;
@@ -714,19 +719,13 @@ static int run_supervisor(const char *rootfs)
     rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
     if (rc != 0) {
         fprintf(stderr, "Failed to create logger thread. Error code: %d\n", rc);
-        bounded_buffer_begin_shutdown(&ctx.log_buffer);
-        bounded_buffer_destroy(&ctx.log_buffer);
-        pthread_mutex_destroy(&ctx.metadata_lock);
-        return 1;
+        goto cleanup_bounded_buffer;
     }
 
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ctx.server_fd == -1) {
         perror("socket");
-        bounded_buffer_begin_shutdown(&ctx.log_buffer);
-        bounded_buffer_destroy(&ctx.log_buffer);
-        pthread_mutex_destroy(&ctx.metadata_lock);
-        return 1;
+        goto cleanup_bounded_buffer;
     }
 
     struct sockaddr_un addr;
@@ -736,32 +735,20 @@ static int run_supervisor(const char *rootfs)
     rc = bind(ctx.server_fd, (struct sockaddr*) &addr, sizeof(addr));
     if (rc == -1) {
         perror("bind");
-        bounded_buffer_begin_shutdown(&ctx.log_buffer);
-        bounded_buffer_destroy(&ctx.log_buffer);
-        pthread_mutex_destroy(&ctx.metadata_lock);
-        return 1;
+        goto cleanup_socket;
     }
 
     rc = listen(ctx.server_fd, 10);
     if (rc == -1) {
         perror("listen");
-        close(ctx.server_fd);
-        bounded_buffer_begin_shutdown(&ctx.log_buffer);
-        bounded_buffer_destroy(&ctx.log_buffer);
-        pthread_mutex_destroy(&ctx.metadata_lock);
-        return 1;
+        goto cleanup_socket;
     }
     printf("Listening for requests\n");
 
     rc = pipe(ctx.shutdown_pipe_fds);
     if (rc != 0) {
         perror("pipe");
-        unlink(CONTROL_PATH);
-        close(ctx.server_fd);
-        bounded_buffer_begin_shutdown(&ctx.log_buffer);
-        bounded_buffer_destroy(&ctx.log_buffer);
-        pthread_mutex_destroy(&ctx.metadata_lock);
-        return 1;
+        goto cleanup_socket;
     }
 
     signal(SIGINT, stop_supervisor);
@@ -812,11 +799,13 @@ static int run_supervisor(const char *rootfs)
 
     printf("\nStopping supervisor\n");
 
-    (void) rootfs;
-    unlink(CONTROL_PATH);
-    close(ctx.server_fd);
     close(ctx.shutdown_pipe_fds[1]); // sends shutdown signal to logging threads
 
+cleanup_socket:
+    close(ctx.server_fd);
+    unlink(CONTROL_PATH);
+
+cleanup_bounded_buffer:
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
