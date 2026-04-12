@@ -654,6 +654,22 @@ cleanup_pipe:
     return rc;
 }
 
+void get_containers_status(supervisor_ctx_t *ctx, char *buf, int n) {
+    int len = 0;
+    pthread_mutex_lock(&ctx->metadata_lock);
+    container_record_t *container = ctx->containers;
+    if (container == NULL) {
+        snprintf(buf, n, "No containers yet.\n");
+    } else {
+        while (container != NULL && len < n) {
+            const char *state_str = state_to_string(container->state);
+            len += snprintf(buf + len, n - len, "%s: %s\n", container->id, state_str);
+            container = container->next;
+        }
+    }
+    pthread_mutex_unlock(&ctx->metadata_lock);
+}
+
 void *handle_client(void *arg) {
     client_handler_thread_args_t *args = (client_handler_thread_args_t*) arg;
     int client_fd = args->client_fd;
@@ -693,7 +709,9 @@ void *handle_client(void *arg) {
             printf("Received run request\n");
             break;
         case CMD_PS:
-            printf("Received ps request\n");
+            send_response = 1;
+            response.status = 200;
+            get_containers_status(args->ctx, response.message, sizeof(response.message));
             break;
         case CMD_LOGS:
             printf("Received logs request\n");
