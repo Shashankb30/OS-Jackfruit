@@ -30,6 +30,7 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -155,6 +156,14 @@ typedef struct {
     supervisor_ctx_t *ctx;
     int client_fd;
 } client_handler_thread_args_t;
+
+typedef struct {
+    const char *rootfs;
+    const char *command;
+    const char *hostname;
+    int cout_fd[2];
+    int cin_fd[2];
+} child_args_t;
 
 supervisor_ctx_t *supervisor_ctx = NULL;
 
@@ -408,6 +417,31 @@ void *logging_thread(void *arg)
     }
 }
 
+int setup_root(const char *rootfs)
+{
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+        return -1;
+
+    if (mount(rootfs, rootfs, NULL, MS_BIND | MS_REC, NULL) != 0)
+        return -1;
+
+    char old_root[PATH_MAX];
+    snprintf(old_root, sizeof(old_root), "%s/.old_root", rootfs);
+    mkdir(old_root, 0755);
+
+    if (syscall(SYS_pivot_root, rootfs, old_root) != 0)
+        return -1;
+
+    if (chdir("/") != 0)
+        return -1;
+
+    if (umount2("/.old_root", MNT_DETACH) != 0)
+        return -1;
+
+    rmdir("/.old_root");
+    return 0;
+}
+
 /*
  * TODO:
  * Implement the clone child entrypoint.
@@ -419,26 +453,37 @@ void *logging_thread(void *arg)
  *   - stdout / stderr redirected to the supervisor logging path
  *   - configured command executed inside the container
  */
-void child_fn(const char *rootfs, const char *command, int cout_fd[2], int cin_fd[2])
+int child_fn(void *arg)
 {
-    const char shell[] = "/bin/sh";
-    char shell_path[PATH_MAX + sizeof(shell)] = {0};
-    strncpy(shell_path, rootfs, PATH_MAX);
-    strcat(shell_path, shell);
+    child_args_t *args = (child_args_t*) arg;
 
-    close(cout_fd[0]);
-    dup2(cout_fd[1], STDOUT_FILENO);
-    dup2(cout_fd[1], STDERR_FILENO);
-    close(cout_fd[1]);
+    close(args->cout_fd[0]);
+    dup2(args->cout_fd[1], STDOUT_FILENO);
+    dup2(args->cout_fd[1], STDERR_FILENO);
+    close(args->cout_fd[1]);
 
-    close(cin_fd[1]);
-    dup2(cin_fd[0], STDIN_FILENO);
-    close(cin_fd[0]);
+    close(args->cin_fd[1]);
+    dup2(args->cin_fd[0], STDIN_FILENO);
+    close(args->cin_fd[0]);
+
+    if (setup_root(args->rootfs) != 0) {
+        return 1;
+    }
+
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        perror("mount");
+        return 1;
+    }
+
+    if (sethostname(args->hostname, strlen(args->hostname)) == -1) {
+        perror("sethostname");
+        return 1;
+    }
 
     setpgid(0, 0);
-    execl(shell_path, "/bin/sh", "-c", command, NULL);
+    execl("/bin/sh", "sh", "-c", args->command, NULL);
     perror("execl");
-    exit(1);
+    return 1;
 }
 
 int register_with_monitor(int monitor_fd,
@@ -646,23 +691,44 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
         goto cleanup_ctx_containers;
     }
 
-    log_capture_thread_args_t *args = malloc(sizeof(log_capture_thread_args_t));
-    args->ctx = ctx;
-    args->container = container;
-    args->log_fd = cout_fds[0];
+    log_capture_thread_args_t *logger_args = malloc(sizeof(log_capture_thread_args_t));
+    logger_args->ctx = ctx;
+    logger_args->container = container;
+    logger_args->log_fd = cout_fds[0];
 
     pthread_t container_log_thread;
-    rc = pthread_create(&container_log_thread, NULL, capture_container_log, args);
+    rc = pthread_create(&container_log_thread, NULL, capture_container_log, logger_args);
     if (rc != 0) {
         fprintf(stderr, "Failed to create log capture thread for container %s\n", container->id);
         rc = -1;
         goto cleanup_logger;
     }
 
-    pid_t pid = fork();
-    if (pid == 0) {
-        child_fn(request->rootfs, request->command, cout_fds, cin_fds); // does not return
-    } else if (pid > 0) {
+    child_args_t *child_args = malloc(sizeof(child_args_t));
+    child_args->rootfs = request->rootfs;
+    child_args->command = request->command;
+    child_args->hostname = container->id;
+    child_args->cout_fd[0] = cout_fds[0];
+    child_args->cout_fd[1] = cout_fds[1];
+    child_args->cin_fd[0] = cin_fds[0];
+    child_args->cin_fd[1] = cin_fds[1];
+
+    char *child_stack = malloc(STACK_SIZE);
+    if (!child_stack) {
+        perror("malloc");
+        free(child_args);
+        rc = -1;
+        goto cleanup_logger;
+    }
+
+    pid_t pid = clone(
+        child_fn,
+        child_stack + STACK_SIZE,
+        CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+        child_args
+    );
+
+    if (pid > 0) {
         close(cout_fds[1]);
         close(cin_fds[0]);
         printf("Started container %s with PID %d\n", container->id, pid);
@@ -675,11 +741,14 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
         return 0;
     }
 
-    perror("fork");
+    perror("clone");
     rc = -1;
 
+    free(child_stack);
+    free(child_args);
+
 cleanup_logger:
-    free(args);
+    free(logger_args);
     close(container->log_file_fd);
 
 cleanup_ctx_containers:
