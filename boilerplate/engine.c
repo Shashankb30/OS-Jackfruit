@@ -443,6 +443,15 @@ int setup_root(const char *rootfs)
     return 0;
 }
 
+pid_t child_pid = -1;
+
+void forward_sig(int sig) {
+    if (child_pid == -1) return;
+    if (kill(-child_pid, sig) == -1) {
+        perror("kill");
+    }
+}
+
 /*
  * TODO:
  * Implement the clone child entrypoint.
@@ -481,9 +490,33 @@ int child_fn(void *arg)
         return 1;
     }
 
-    setpgid(0, 0);
-    execl("/bin/sh", "sh", "-c", args->command, NULL);
-    perror("execl");
+    signal(SIGINT, forward_sig);
+    signal(SIGTERM, forward_sig);
+
+    // Fork because PID 1 ignores SIGTERM
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", args->command, NULL);
+        perror("execl");
+        exit(1);
+    }
+    child_pid = pid;
+
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        perror("waitpid");
+        return 1;
+    }
+    child_pid = -1;
+
+    if (WIFEXITED(status)) {
+        exit(WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        int sig = WTERMSIG(status);
+        exit(128 + sig);
+    };
+
     return 1;
 }
 
@@ -563,7 +596,7 @@ void *capture_container_log(void *arg) {
         }
 
         if (fds[0].revents & (POLLIN | POLLHUP)) {
-            int rc = kill(-(container->host_pid), SIGKILL);
+            int rc = kill(container->host_pid, SIGKILL);
             if (rc == -1) {
                 perror("kill");
             }
@@ -579,12 +612,18 @@ void *capture_container_log(void *arg) {
                 break;
             }
 
+            int exit_code = -1;
             if (WIFEXITED(status)) {
-                container->exit_code = WEXITSTATUS(status);
-                container->state = CONTAINER_EXITED;
-                printf("Container '%s' exited with code %d\n", container->id, container->exit_code);
-            } else if (WIFSIGNALED(status)) {
-                container->exit_code = WTERMSIG(status);
+                exit_code = WEXITSTATUS(status);
+                if (exit_code < 128) {
+                    container->exit_code = exit_code;
+                    container->state = CONTAINER_EXITED;
+                    printf("Container '%s' exited with code %d\n", container->id, container->exit_code);
+                }
+            }
+
+            if (WIFSIGNALED(status) || exit_code > 128) {
+                container->exit_code = exit_code > 128 ? exit_code - 128 : WTERMSIG(status);
                 if (container->stop_requested && container->exit_code != SIGKILL) {
                     container->state = CONTAINER_STOPPED;
                     printf("Container '%s' was stopped by signal %d\n", container->id, container->exit_code);
@@ -872,8 +911,10 @@ int stop_container(container_record_t *container, int signal) {
         return 2;
     }
 
-    container->stop_requested = 1;
-    int rc = kill(-(container->host_pid), signal);
+    if (signal == SIGTERM) {
+        container->stop_requested = 1;
+    }
+    int rc = kill(container->host_pid, signal);
     if (rc == -1) {
         perror("kill");
     }
