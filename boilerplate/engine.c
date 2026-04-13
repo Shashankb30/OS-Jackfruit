@@ -541,6 +541,26 @@ void *capture_container_log(void *arg) {
             break;
         }
 
+        if (fds[1].revents & POLLIN) {
+            int bytes_read = read(fds[1].fd, log_item.data, sizeof(log_item.data));
+            if (bytes_read < 0) {
+                perror("read");
+                break;
+            }
+
+            log_item.length = bytes_read;
+            bounded_buffer_push(&args->ctx->log_buffer, &log_item);
+
+            pthread_mutex_lock(&container->stream_lock);
+            if (container->should_stream) {
+                int bytes_written = write(container->streamfds[1], log_item.data, bytes_read);
+                if (bytes_written == -1) {
+                    perror("write");
+                }
+            }
+            pthread_mutex_unlock(&container->stream_lock);
+        }
+
         if (fds[0].revents & (POLLIN | POLLHUP)) {
             int rc = kill(-(container->host_pid), SIGKILL);
             if (rc == -1) {
@@ -578,26 +598,6 @@ void *capture_container_log(void *arg) {
             }
             pthread_mutex_unlock(&container->stream_lock);
             break;
-        }
-
-        if (fds[1].revents & POLLIN) {
-            int bytes_read = read(fds[1].fd, log_item.data, sizeof(log_item.data));
-            if (bytes_read < 0) {
-                perror("read");
-                break;
-            }
-
-            log_item.length = bytes_read;
-            bounded_buffer_push(&args->ctx->log_buffer, &log_item);
-
-            pthread_mutex_lock(&container->stream_lock);
-            if (container->should_stream) {
-                int bytes_written = write(container->streamfds[1], log_item.data, bytes_read);
-                if (bytes_written == -1) {
-                    perror("write");
-                }
-            }
-            pthread_mutex_unlock(&container->stream_lock);
         }
     }
 
