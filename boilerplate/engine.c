@@ -77,6 +77,7 @@ typedef struct container_record {
     unsigned long hard_limit_bytes;
     int exit_code;
     int exit_signal;
+    int stop_requested;
 
     char rootfs[PATH_MAX];
     char command[CHILD_COMMAND_LEN];
@@ -584,19 +585,31 @@ void *capture_container_log(void *arg) {
                 printf("Container '%s' exited with code %d\n", container->id, container->exit_code);
             } else if (WIFSIGNALED(status)) {
                 container->exit_code = WTERMSIG(status);
-                container->state = CONTAINER_STOPPED;
-                printf("Container '%s' was terminated by signal %d\n", container->id, container->exit_code);
+                if (container->stop_requested && container->exit_code != SIGKILL) {
+                    container->state = CONTAINER_STOPPED;
+                    printf("Container '%s' was stopped by signal %d\n", container->id, container->exit_code);
+                } else {
+                    container->state = CONTAINER_KILLED;
+                    printf("Container '%s' was killed by signal %d\n", container->id, container->exit_code);
+                }
             } else {
                 fprintf(stderr, "Container '%s' is in unknown state: %d\n", container->id, status);
                 container->exit_code = -1;
                 container->state = CONTAINER_STOPPED;
             }
 
+            int should_destroy = 0;
             pthread_mutex_lock(&container->stream_lock);
             if (container->should_stream) {
                 close(container->streamfds[1]);
+            } else {
+                should_destroy = 1;
             }
             pthread_mutex_unlock(&container->stream_lock);
+            if (should_destroy) {
+                pthread_mutex_destroy(&container->stream_lock);
+                container->stream_lock_initialized = 0;
+            }
             break;
         }
     }
@@ -615,6 +628,7 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
     strncpy(container->command, request->command, CHILD_COMMAND_LEN);
     container->nice_value = request->nice_value;
     container->state = CONTAINER_STARTING;
+    container->stop_requested = 0;
 
     int cout_fds[2] = {-1};
     int rc = pipe(cout_fds);
@@ -654,7 +668,11 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
                 rc = 1;
                 goto cleanup_pipe;
             } else {
-                while (*((volatile int*) &tmp->stream_lock_initialized));
+                if (tmp->stream_lock_initialized) {
+                    pthread_mutex_unlock(&ctx->metadata_lock);
+                    rc = 1;
+                    goto cleanup_pipe;
+                }
                 if (prev != NULL) {
                     prev->next = tmp->next;
                 } else {
@@ -854,6 +872,7 @@ int stop_container(container_record_t *container, int signal) {
         return 2;
     }
 
+    container->stop_requested = 1;
     int rc = kill(-(container->host_pid), signal);
     if (rc == -1) {
         perror("kill");
