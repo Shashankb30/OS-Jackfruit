@@ -81,7 +81,14 @@ typedef struct container_record {
     char command[CHILD_COMMAND_LEN];
     int nice_value;
 
-    int log_write_fd;
+    int container_out_fd;
+    int container_in_fd;
+
+    int stream_lock_initialized;
+    pthread_mutex_t stream_lock;
+    int should_stream;
+    int streamfds[2];
+
     int log_file_fd;
     char log_path[PATH_MAX];
 
@@ -121,6 +128,14 @@ typedef struct {
 } control_response_t;
 
 typedef struct {
+    char is_control;
+    union {
+        int payload_len;
+        int control_signal;
+    } info;
+} streaming_chunk_t;
+
+typedef struct {
     int server_fd;
     int monitor_fd;
     int shutdown_pipe_fds[2]; // used as a shutdown signal
@@ -132,7 +147,7 @@ typedef struct {
 
 typedef struct {
     supervisor_ctx_t *ctx;
-    char container_id[CONTAINER_ID_LEN];
+    container_record_t *container;
     int log_fd;
 } log_capture_thread_args_t;
 
@@ -404,18 +419,23 @@ void *logging_thread(void *arg)
  *   - stdout / stderr redirected to the supervisor logging path
  *   - configured command executed inside the container
  */
-void child_fn(const char *rootfs, const char *command, int pipe_fd[2])
+void child_fn(const char *rootfs, const char *command, int cout_fd[2], int cin_fd[2])
 {
     const char shell[] = "/bin/sh";
     char shell_path[PATH_MAX + sizeof(shell)] = {0};
     strncpy(shell_path, rootfs, PATH_MAX);
     strcat(shell_path, shell);
 
-    close(pipe_fd[0]);
-    dup2(pipe_fd[1], STDOUT_FILENO);
-    dup2(pipe_fd[1], STDERR_FILENO);
-    close(pipe_fd[1]);
+    close(cout_fd[0]);
+    dup2(cout_fd[1], STDOUT_FILENO);
+    dup2(cout_fd[1], STDERR_FILENO);
+    close(cout_fd[1]);
 
+    close(cin_fd[1]);
+    dup2(cin_fd[0], STDIN_FILENO);
+    close(cin_fd[0]);
+
+    setpgid(0, 0);
     execl(shell_path, "/bin/sh", "-c", command, NULL);
     perror("execl");
     exit(1);
@@ -457,6 +477,7 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
 
 void *capture_container_log(void *arg) {
     log_capture_thread_args_t *args = (log_capture_thread_args_t*) arg;
+    container_record_t *container = args->container;
 
     struct pollfd fds[2];
     fds[0].events = POLLIN;
@@ -465,7 +486,7 @@ void *capture_container_log(void *arg) {
     fds[1].fd = args->log_fd;
 
     log_item_t log_item;
-    strncpy(log_item.container_id, args->container_id, sizeof(log_item.container_id));
+    strncpy(log_item.container_id, container->id, sizeof(log_item.container_id));
 
     while (1) {
         int n = poll(fds, 2, -1);
@@ -475,21 +496,15 @@ void *capture_container_log(void *arg) {
             break;
         }
 
-        if (fds[0].revents & (POLLIN | POLLHUP)) break; // shutdown signal
+        if (fds[0].revents & (POLLIN | POLLHUP)) {
+            int rc = kill(-(container->host_pid), SIGKILL);
+            if (rc == -1) {
+                perror("kill");
+            }
+            break;
+        }
 
         if (fds[1].revents & POLLHUP) {
-            pthread_mutex_lock(&args->ctx->metadata_lock);
-            container_record_t *container = args->ctx->containers;
-            while (container != NULL && container->log_write_fd != args->log_fd) {
-                container = container->next;
-            }
-            pthread_mutex_unlock(&args->ctx->metadata_lock);
-
-            if (container == NULL) {
-                fprintf(stderr, "Failed to find container with log write fd %d\n", args->log_fd);
-                break;
-            }
-
             int status;
             pid_t rpid = waitpid(container->host_pid, &status, 0);
             close(container->log_file_fd);
@@ -512,11 +527,16 @@ void *capture_container_log(void *arg) {
                 container->state = CONTAINER_STOPPED;
             }
 
+            pthread_mutex_lock(&container->stream_lock);
+            if (container->should_stream) {
+                close(container->streamfds[1]);
+            }
+            pthread_mutex_unlock(&container->stream_lock);
             break;
         }
 
         if (fds[1].revents & POLLIN) {
-            int bytes_read = read(fds[1].fd, &log_item.data[log_item.length], sizeof(log_item.data) - log_item.length);
+            int bytes_read = read(fds[1].fd, log_item.data, sizeof(log_item.data));
             if (bytes_read < 0) {
                 perror("read");
                 break;
@@ -524,15 +544,24 @@ void *capture_container_log(void *arg) {
 
             log_item.length = bytes_read;
             bounded_buffer_push(&args->ctx->log_buffer, &log_item);
+
+            pthread_mutex_lock(&container->stream_lock);
+            if (container->should_stream) {
+                int bytes_written = write(container->streamfds[1], log_item.data, bytes_read);
+                if (bytes_written == -1) {
+                    perror("write");
+                }
+            }
+            pthread_mutex_unlock(&container->stream_lock);
         }
     }
 
-    close(args->log_fd);
+    close(container->log_file_fd);
     free(args);
     return NULL;
 }
 
-int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
+int start_container(supervisor_ctx_t *ctx, control_request_t *request, container_record_t **container_out) {
     __label__ cleanup_pipe, cleanup_ctx_containers, cleanup_logger;
 
     container_record_t *container = malloc(sizeof(container_record_t));
@@ -542,14 +571,33 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     container->nice_value = request->nice_value;
     container->state = CONTAINER_STARTING;
 
-    int pipe_fd[2] = {-1};
-    int rc = pipe(pipe_fd);
+    int cout_fds[2] = {-1};
+    int rc = pipe(cout_fds);
     if (rc != 0) {
         perror("rc");
         free(container);
         return -1;
     }
-    container->log_write_fd = pipe_fd[0];
+    container->container_out_fd = cout_fds[0];
+
+    int cin_fds[2] = {-1};
+    rc = pipe(cin_fds);
+    if (rc != 0) {
+        perror("rc");
+        free(container);
+        return -1;
+    }
+    container->container_in_fd = cin_fds[1];
+
+    container->should_stream = 0;
+    rc = pthread_mutex_init(&container->stream_lock, NULL);
+    if (rc != 0) {
+        errno = rc;
+        perror("pthread_mutex_init");
+        free(container);
+        return -1;
+    }
+    container->stream_lock_initialized = 1;
 
     pthread_mutex_lock(&ctx->metadata_lock);
     container_record_t *tmp = ctx->containers;
@@ -561,6 +609,7 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
                 rc = 1;
                 goto cleanup_pipe;
             } else {
+                while (*((volatile int*) &tmp->stream_lock_initialized));
                 if (prev != NULL) {
                     prev->next = tmp->next;
                 } else {
@@ -598,9 +647,9 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
     }
 
     log_capture_thread_args_t *args = malloc(sizeof(log_capture_thread_args_t));
-    strncpy(args->container_id, container->id, sizeof(args->container_id));
     args->ctx = ctx;
-    args->log_fd = pipe_fd[0];
+    args->container = container;
+    args->log_fd = cout_fds[0];
 
     pthread_t container_log_thread;
     rc = pthread_create(&container_log_thread, NULL, capture_container_log, args);
@@ -612,13 +661,17 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request) {
 
     pid_t pid = fork();
     if (pid == 0) {
-        child_fn(request->rootfs, request->command, pipe_fd); // does not return
+        child_fn(request->rootfs, request->command, cout_fds, cin_fds); // does not return
     } else if (pid > 0) {
-        close(pipe_fd[1]);
+        close(cout_fds[1]);
+        close(cin_fds[0]);
         printf("Started container %s with PID %d\n", container->id, pid);
         container->host_pid = pid;
         container->started_at = time(NULL);
         container->state = CONTAINER_RUNNING;
+        if (container_out != NULL) {
+            *container_out = container;
+        }
         return 0;
     }
 
@@ -646,8 +699,11 @@ cleanup_ctx_containers:
     pthread_mutex_unlock(&ctx->metadata_lock);
 
 cleanup_pipe:
-    close(pipe_fd[0]);
-    close(pipe_fd[1]);
+    pthread_mutex_destroy(&container->stream_lock);
+    close(cout_fds[0]);
+    close(cout_fds[1]);
+    close(cin_fds[0]);
+    close(cin_fds[1]);
     free(container);
     return rc;
 }
@@ -724,7 +780,20 @@ int get_container_logs(supervisor_ctx_t *ctx, const control_request_t *request, 
     return 0;
 }
 
-int stop_container(supervisor_ctx_t *ctx, const char *container_id) {
+int stop_container(container_record_t *container, int signal) {
+    if (container->state != CONTAINER_RUNNING) {
+        return 2;
+    }
+
+    int rc = kill(-(container->host_pid), signal);
+    if (rc == -1) {
+        perror("kill");
+    }
+
+    return rc;
+}
+
+int stop_container_by_id(supervisor_ctx_t *ctx, const char *container_id, int signal) {
     pthread_mutex_lock(&ctx->metadata_lock);
     container_record_t *container = ctx->containers;
     if (container == NULL) {
@@ -734,24 +803,125 @@ int stop_container(supervisor_ctx_t *ctx, const char *container_id) {
         while (container != NULL) {
             if (strncmp(container_id, container->id, sizeof(container->id)) == 0) {
                 pthread_mutex_unlock(&ctx->metadata_lock);
-
-                if (container->state != CONTAINER_RUNNING) {
-                    return 2;
-                }
-
-                int rc = kill(container->host_pid, SIGTERM);
-                if (rc == -1) {
-                    perror("kill");
-                    return -1;
-                }
-
-                return 0;
+                return stop_container(container, signal);
             }
             container = container->next;
         }
     }
     pthread_mutex_unlock(&ctx->metadata_lock);
     return 1;
+}
+
+int stream_container_stdio(container_record_t *container, int client_fd) {
+    if (!container->stream_lock_initialized) return -1;
+
+
+    pthread_mutex_lock(&container->stream_lock);
+    if (container->should_stream) {
+        pthread_mutex_unlock(&container->stream_lock);
+        return -1;
+    }
+
+    int rc = pipe(container->streamfds);
+    if (rc == -1) {
+        pthread_mutex_unlock(&container->stream_lock);
+        perror("pipe");
+        return -1;
+    }
+
+    container->should_stream = 1;
+    pthread_mutex_unlock(&container->stream_lock);
+
+
+    struct pollfd pollfds[2];
+    pollfds[0].events = POLLIN;
+    pollfds[0].fd = container->streamfds[0];
+
+    pollfds[1].events = POLLIN;
+    pollfds[1].fd = client_fd;
+
+    streaming_chunk_t chunk;
+    char buf[128];
+    while (1) {
+        rc = poll(pollfds, 2, -1);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+
+        if ((pollfds[0].revents & POLLHUP) || (pollfds[1].revents & POLLHUP)) {
+            pthread_mutex_lock(&container->stream_lock);
+            container->should_stream = 0;
+            if (!(pollfds[0].revents & POLLHUP)) {
+                close(container->streamfds[0]);
+            }
+            close(container->streamfds[1]);
+            pthread_mutex_unlock(&container->stream_lock);
+            pthread_mutex_destroy(&container->stream_lock);
+            container->stream_lock_initialized = 0;
+            return 0;
+        }
+
+        if (pollfds[0].revents & POLLIN) {
+            rc = read(pollfds[0].fd, buf, sizeof(buf));
+            if (rc == -1) {
+                perror("read");
+                break;
+            }
+
+            rc = write(client_fd, buf, rc);
+            if (rc == -1) {
+                perror("write");
+                break;
+            }
+        }
+
+        if (pollfds[1].revents & POLLIN) {
+            rc = read(pollfds[1].fd, (void*) &chunk, sizeof(chunk));
+            if (rc == -1) {
+                perror("read");
+                break;
+            }
+
+            if (chunk.is_control) {
+                printf("Sending signal %d to container '%s'\n", chunk.info.control_signal, container->id);
+                rc = stop_container(container, chunk.info.control_signal);
+                if (rc != 0) {
+                    fprintf(stderr, "Could not send signal\n");
+                }
+                continue;
+            }
+
+            while (chunk.info.payload_len) {
+                int recv_len = sizeof(buf);
+                if (chunk.info.payload_len < recv_len) {
+                    recv_len = chunk.info.payload_len;
+                }
+
+                rc = read(pollfds[1].fd, &buf, recv_len);
+                if (rc == -1) {
+                    perror("read");
+                    break;
+                }
+                if (rc != recv_len) {
+                    rc = -1;
+                    break;
+                }
+
+                rc = write(container->container_in_fd, buf, recv_len);
+                if (rc == -1) {
+                    perror("write");
+                    break;
+                }
+                chunk.info.payload_len -= recv_len;
+            }
+
+            if (rc == -1) break;
+        }
+    }
+
+    return rc;
 }
 
 void *handle_client(void *arg) {
@@ -771,12 +941,14 @@ void *handle_client(void *arg) {
     control_response_t response;
     memset(&response, 0, sizeof(response));
 
+    container_record_t *container;
+
     switch (request.kind) {
         case CMD_SUPERVISOR:
             fprintf(stderr, "Received request of type 'CMD_SUPERVISOR'\n");
             break;
         case CMD_START:
-            rc = start_container(args->ctx, &request);
+            rc = start_container(args->ctx, &request, NULL);
             send_response = 1;
             if (rc == 0) {
                 response.status = 201;
@@ -790,7 +962,29 @@ void *handle_client(void *arg) {
             }
             break;
         case CMD_RUN:
-            printf("Received run request\n");
+            rc = start_container(args->ctx, &request, &container);
+            send_response = 1;
+            if (rc == 1) {
+                response.status = 400;
+                snprintf(response.message, sizeof(response.message), "Container with id '%s' already exists!", request.container_id);
+                break;
+            } else if (rc != 0) {
+                response.status = 500;
+                snprintf(response.message, sizeof(response.message), "An internal error occurred.");
+                break;
+            }
+
+            send_response = 0;
+            response.status = 201;
+            snprintf(response.message, sizeof(response.message), "Created container with id '%s'", request.container_id);
+
+            rc = write(client_fd, (const void*) &response, sizeof(response));
+            if (rc == -1) {
+                perror("write");
+                break;
+            }
+
+            stream_container_stdio(container, args->client_fd);
             break;
         case CMD_PS:
             send_response = 1;
@@ -811,7 +1005,7 @@ void *handle_client(void *arg) {
             }
             break;
         case CMD_STOP:
-            rc = stop_container(args->ctx, request.container_id);
+            rc = stop_container_by_id(args->ctx, request.container_id, SIGTERM);
             send_response = 1;
             if (rc == 0) {
                 response.status = 200;
@@ -1016,7 +1210,7 @@ cleanup_bounded_buffer:
  * logging pipe. A UNIX domain socket is the most direct option, but a
  * FIFO or shared memory design is also acceptable if justified.
  */
-static int send_control_request(const control_request_t *req)
+static int send_control_request(const control_request_t *req, int *server_fd_out)
 {
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd == -1) {
@@ -1046,12 +1240,17 @@ static int send_control_request(const control_request_t *req)
     rc = read(server_fd, (void*) &response, sizeof(response));
     if (rc == -1) {
         perror("read");
+        close(server_fd);
     } else if (rc > 0) {
         response.message[sizeof(response.message) - 1] = '\0';
-        printf("Status: %d\nMessage: %s\n", response.status, response.message);
+        printf("Status: %d\n%s\n", response.status, response.message);
     }
 
-    close(server_fd);
+    if (server_fd_out == NULL) {
+        close(server_fd);
+    } else {
+        *server_fd_out = server_fd;
+    }
     return 0;
 }
 
@@ -1077,7 +1276,22 @@ static int cmd_start(int argc, char *argv[])
     if (parse_optional_flags(&req, argc, argv, 5) != 0)
         return 1;
 
-    return send_control_request(&req);
+    return send_control_request(&req, NULL);
+}
+
+int g_server_fd = -1;
+
+void forward_signal(int sig) {
+    if (g_server_fd == -1) return;
+
+    streaming_chunk_t chunk;
+    chunk.is_control = 1;
+    chunk.info.control_signal = sig;
+
+    int rc = write(g_server_fd, (const void*) &chunk, sizeof(chunk));
+    if (rc == -1) {
+        perror("write");
+    }
 }
 
 static int cmd_run(int argc, char *argv[])
@@ -1102,7 +1316,79 @@ static int cmd_run(int argc, char *argv[])
     if (parse_optional_flags(&req, argc, argv, 5) != 0)
         return 1;
 
-    return send_control_request(&req);
+    int server_fd = -1;
+    int rc = send_control_request(&req, &server_fd);
+    if (rc != 0) {
+        return rc;
+    }
+
+    g_server_fd = server_fd;
+    signal(SIGINT, forward_signal);
+    signal(SIGTERM, forward_signal);
+
+    struct pollfd pollfds[2];
+    pollfds[0].events = POLLIN;
+    pollfds[0].fd = STDIN_FILENO;
+
+    pollfds[1].events = POLLIN;
+    pollfds[1].fd = server_fd;
+
+    streaming_chunk_t chunk;
+    char buf[128];
+    while (1) {
+        rc = poll(pollfds, 2, -1);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+
+        if ((pollfds[0].revents & POLLHUP) || (pollfds[1].revents & POLLHUP)) {
+            break;
+        }
+
+        if (pollfds[0].revents & POLLIN) {
+            rc = read(STDIN_FILENO, buf, sizeof(buf));
+            if (rc == -1) {
+                perror("read");
+                break;
+            }
+
+            chunk.is_control = 0;
+            chunk.info.payload_len = rc;
+            rc = write(server_fd, (void*) &chunk, sizeof(chunk));
+            if (rc == -1) {
+                perror("write");
+                break;
+            }
+
+            rc = write(server_fd, buf, chunk.info.payload_len);
+            if (rc == -1) {
+                perror("write");
+                break;
+            }
+        }
+
+        if (pollfds[1].revents & POLLIN) {
+            rc = read(server_fd, buf, sizeof(buf));
+            if (rc == -1) {
+                perror("read");
+                break;
+            }
+
+            rc = write(STDOUT_FILENO, buf, rc);
+            if (rc == -1) {
+                perror("write");
+                break;
+            }
+
+            fflush(stdout);
+        }
+    }
+
+    g_server_fd = -1;
+    close(server_fd);
+    return 0;
 }
 
 static int cmd_ps(void)
@@ -1112,7 +1398,7 @@ static int cmd_ps(void)
     memset(&req, 0, sizeof(req));
     req.kind = CMD_PS;
 
-    return send_control_request(&req);
+    return send_control_request(&req, NULL);
 }
 
 static int cmd_logs(int argc, char *argv[])
@@ -1128,7 +1414,7 @@ static int cmd_logs(int argc, char *argv[])
     req.kind = CMD_LOGS;
     strncpy(req.container_id, argv[2], sizeof(req.container_id) - 1);
 
-    return send_control_request(&req);
+    return send_control_request(&req, NULL);
 }
 
 static int cmd_stop(int argc, char *argv[])
@@ -1144,7 +1430,7 @@ static int cmd_stop(int argc, char *argv[])
     req.kind = CMD_STOP;
     strncpy(req.container_id, argv[2], sizeof(req.container_id) - 1);
 
-    return send_control_request(&req);
+    return send_control_request(&req, NULL);
 }
 
 int main(int argc, char *argv[])
