@@ -368,7 +368,7 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
     pthread_mutex_lock(&buffer->mutex);
 
-    while (buffer->count == 0 && buffer->active_producers > 0) {
+    while (buffer->count == 0 && (buffer->active_producers > 0 || !buffer->shutting_down)) {
         pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
     }
 
