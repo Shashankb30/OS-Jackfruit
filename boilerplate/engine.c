@@ -29,6 +29,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -164,6 +165,7 @@ typedef struct {
     const char *hostname;
     int cout_fd[2];
     int cin_fd[2];
+    int nice_value;
 } child_args_t;
 
 supervisor_ctx_t *supervisor_ctx = NULL;
@@ -498,6 +500,14 @@ int child_fn(void *arg)
         return 1;
     }
 
+    if (setpriority(PRIO_PROCESS, 0, args->nice_value) != 0) {
+        perror("setpriority");
+    }
+
+    if (setpriority(PRIO_PGRP, getpgrp(), args->nice_value) != 0) {
+        perror("setpriority");
+    }
+
     // Fork because PID 1 ignores SIGTERM
     pid_t pid = fork();
     if (pid == 0) {
@@ -709,6 +719,12 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
     container_record_t *tmp = ctx->containers;
     container_record_t *prev = NULL;
     while (tmp != NULL) {
+        if (tmp->state == CONTAINER_RUNNING && strncmp(tmp->rootfs, request->rootfs, sizeof(tmp->rootfs)) == 0) {
+            pthread_mutex_unlock(&ctx->metadata_lock);
+            rc = 2;
+            goto cleanup_pipe;
+        }
+
         if (strncmp(tmp->id, container->id, sizeof(container->id)) == 0) {
             if (tmp->state == CONTAINER_RUNNING || tmp->state == CONTAINER_STARTING) {
                 pthread_mutex_unlock(&ctx->metadata_lock);
@@ -777,6 +793,7 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
     child_args->cout_fd[1] = cout_fds[1];
     child_args->cin_fd[0] = cin_fds[0];
     child_args->cin_fd[1] = cin_fds[1];
+    child_args->nice_value = container->nice_value;
 
     char *child_stack = malloc(STACK_SIZE);
     if (!child_stack) {
@@ -1097,6 +1114,9 @@ void *handle_client(void *arg) {
             } else if (rc == 1) {
                 response.status = 400;
                 snprintf(response.message, sizeof(response.message), "Container with id '%s' already exists!", request.container_id);
+            } else if (rc == 2) {
+                response.status = 400;
+                snprintf(response.message, sizeof(response.message), "Rootfs directory is in use by another container!");
             } else {
                 response.status = 500;
                 snprintf(response.message, sizeof(response.message), "An internal error occurred.");
@@ -1108,6 +1128,10 @@ void *handle_client(void *arg) {
             if (rc == 1) {
                 response.status = 400;
                 snprintf(response.message, sizeof(response.message), "Container with id '%s' already exists!", request.container_id);
+                break;
+            } else if (rc == 2) {
+                response.status = 400;
+                snprintf(response.message, sizeof(response.message), "Rootfs directory is in use by another container!");
                 break;
             } else if (rc != 0) {
                 response.status = 500;
