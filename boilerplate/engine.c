@@ -80,6 +80,8 @@ typedef struct container_record {
     int exit_signal;
     int stop_requested;
 
+    void *stack_ptr;
+
     char rootfs[PATH_MAX];
     char command[CHILD_COMMAND_LEN];
     int nice_value;
@@ -406,10 +408,10 @@ void *logging_thread(void *arg)
         while (container != NULL && strncmp(log_item.container_id, container->id, sizeof(container->id)) != 0) {
             container = container->next;
         }
-        pthread_mutex_unlock(&ctx->metadata_lock);
 
         if (container == NULL) {
-            fprintf(stderr, "Could not find container with id '%s'\n", container->id);
+            fprintf(stderr, "Could not find container with id '%s'\n", log_item.container_id);
+            pthread_mutex_unlock(&ctx->metadata_lock);
             continue;
         }
 
@@ -417,6 +419,7 @@ void *logging_thread(void *arg)
         if (bytes_written < 0) {
             perror("write");
         }
+        pthread_mutex_unlock(&ctx->metadata_lock);
     }
 }
 
@@ -449,7 +452,7 @@ pid_t child_pid = -1;
 
 void forward_sig(int sig) {
     if (child_pid == -1) return;
-    if (kill(-child_pid, sig) == -1) {
+    if (kill(child_pid, sig) == -1) {
         perror("kill");
     }
 }
@@ -620,12 +623,13 @@ void *capture_container_log(void *arg) {
         if (fds[1].revents & POLLHUP) {
             int status;
             pid_t rpid = waitpid(container->host_pid, &status, 0);
-            close(container->log_file_fd);
             if (rpid < 0) {
                 perror("waitpid");
                 break;
             }
+            free(container->stack_ptr);
 
+            pthread_mutex_lock(&args->ctx->metadata_lock);
             int exit_code = -1;
             if (WIFEXITED(status)) {
                 exit_code = WEXITSTATUS(status);
@@ -650,6 +654,7 @@ void *capture_container_log(void *arg) {
                 container->exit_code = -1;
                 container->state = CONTAINER_STOPPED;
             }
+            pthread_mutex_unlock(&args->ctx->metadata_lock);
 
             unregister_from_monitor(args->ctx->monitor_fd, container->id, container->host_pid);
 
@@ -739,7 +744,7 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
                 if (prev != NULL) {
                     prev->next = tmp->next;
                 } else {
-                    ctx->containers = NULL;
+                    ctx->containers = tmp->next;
                 }
                 free(tmp);
                 break;
@@ -784,6 +789,7 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
         rc = -1;
         goto cleanup_logger;
     }
+    pthread_detach(container_log_thread);
 
     child_args_t *child_args = malloc(sizeof(child_args_t));
     child_args->rootfs = request->rootfs;
@@ -813,17 +819,24 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
     if (pid > 0) {
         close(cout_fds[1]);
         close(cin_fds[0]);
+
+        pthread_mutex_lock(&ctx->metadata_lock);
         container->host_pid = pid;
         container->started_at = time(NULL);
+        container->stack_ptr = child_stack;
         container->state = CONTAINER_RUNNING;
+        pthread_mutex_unlock(&ctx->metadata_lock);
+
+        printf("Started container %s with PID %d\n", container->id, pid);
         if (container_out != NULL) {
             *container_out = container;
         }
-        printf("Started container %s with PID %d\n", container->id, pid);
+
         rc = register_with_monitor(ctx->monitor_fd, container->id, container->host_pid, container->soft_limit_bytes, container->hard_limit_bytes);
         if (rc != 0) {
             fprintf(stderr, "Failed to register container '%s' with monitor\n", container->id);
         }
+
         return 0;
     }
 
@@ -935,10 +948,13 @@ int get_container_logs(supervisor_ctx_t *ctx, const control_request_t *request, 
     return 0;
 }
 
-int stop_container(container_record_t *container, int signal) {
+int stop_container(pthread_mutex_t *lock, container_record_t *container, int signal) {
+    pthread_mutex_lock(lock);
     if (container->state != CONTAINER_RUNNING) {
+        pthread_mutex_unlock(lock);
         return 2;
     }
+    pthread_mutex_unlock(lock);
 
     if (signal == SIGTERM) {
         container->stop_requested = 1;
@@ -961,7 +977,7 @@ int stop_container_by_id(supervisor_ctx_t *ctx, const char *container_id, int si
         while (container != NULL) {
             if (strncmp(container_id, container->id, sizeof(container->id)) == 0) {
                 pthread_mutex_unlock(&ctx->metadata_lock);
-                return stop_container(container, signal);
+                return stop_container(&ctx->metadata_lock, container, signal);
             }
             container = container->next;
         }
@@ -970,7 +986,7 @@ int stop_container_by_id(supervisor_ctx_t *ctx, const char *container_id, int si
     return 1;
 }
 
-int stream_container_stdio(container_record_t *container, int client_fd) {
+int stream_container_stdio(pthread_mutex_t *lock, container_record_t *container, int client_fd) {
     if (!container->stream_lock_initialized) return -1;
 
 
@@ -1044,7 +1060,7 @@ int stream_container_stdio(container_record_t *container, int client_fd) {
 
             if (chunk.is_control) {
                 printf("Sending signal %d to container '%s'\n", chunk.info.control_signal, container->id);
-                rc = stop_container(container, chunk.info.control_signal);
+                rc = stop_container(lock, container, chunk.info.control_signal);
                 if (rc != 0) {
                     fprintf(stderr, "Could not send signal\n");
                 }
@@ -1149,7 +1165,7 @@ void *handle_client(void *arg) {
                 break;
             }
 
-            stream_container_stdio(container, args->client_fd);
+            stream_container_stdio(&args->ctx->metadata_lock, container, args->client_fd);
             break;
         case CMD_PS:
             send_response = 1;
@@ -1349,6 +1365,8 @@ static int run_supervisor(const char *rootfs)
             free(client_thread_args);
             continue;
         }
+
+        pthread_detach(handler_thread);
     }
 
     printf("\nStopping supervisor\n");
