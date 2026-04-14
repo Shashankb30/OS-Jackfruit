@@ -112,6 +112,7 @@ typedef struct {
     size_t tail;
     size_t count;
     int shutting_down;
+    int active_producers;
     pthread_mutex_t mutex;
     pthread_cond_t not_empty;
     pthread_cond_t not_full;
@@ -367,11 +368,11 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
     pthread_mutex_lock(&buffer->mutex);
 
-    while (buffer->count == 0 && !buffer->shutting_down) {
+    while (buffer->count == 0 && buffer->active_producers > 0) {
         pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
     }
 
-    if (buffer->count == 0 && buffer->shutting_down) {
+    if (buffer->count == 0 && buffer->active_producers == 0) {
         pthread_mutex_unlock(&buffer->mutex);
         return -1;
     }
@@ -575,6 +576,10 @@ void *capture_container_log(void *arg) {
     log_capture_thread_args_t *args = (log_capture_thread_args_t*) arg;
     container_record_t *container = args->container;
 
+    pthread_mutex_lock(&args->ctx->log_buffer.mutex);
+    args->ctx->log_buffer.active_producers++;
+    pthread_mutex_unlock(&args->ctx->log_buffer.mutex);
+
     struct pollfd fds[2];
     fds[0].events = POLLIN;
     fds[0].fd = args->ctx->shutdown_pipe_fds[0];
@@ -600,7 +605,10 @@ void *capture_container_log(void *arg) {
             }
 
             log_item.length = bytes_read;
-            bounded_buffer_push(&args->ctx->log_buffer, &log_item);
+            int rc = bounded_buffer_push(&args->ctx->log_buffer, &log_item);
+            if (rc != 0) {
+                break;
+            }
 
             pthread_mutex_lock(&container->stream_lock);
             if (container->should_stream) {
@@ -673,6 +681,11 @@ void *capture_container_log(void *arg) {
             break;
         }
     }
+
+    pthread_mutex_lock(&args->ctx->log_buffer.mutex);
+    args->ctx->log_buffer.active_producers--;
+    pthread_cond_broadcast(&args->ctx->log_buffer.not_empty); // so any waiting consumers exit
+    pthread_mutex_unlock(&args->ctx->log_buffer.mutex);
 
     close(container->log_file_fd);
     free(args);
