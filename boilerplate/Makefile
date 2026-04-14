@@ -5,7 +5,7 @@ PWD := $(shell pwd)
 # If you want host-built workload binaries to run directly inside an Alpine
 # rootfs, you can override this with WORKLOAD_LDFLAGS=-static when your
 # toolchain supports it.
-WORKLOAD_LDFLAGS ?= -static
+WORKLOAD_LDFLAGS = -static
 
 USER_TARGETS := engine memory_hog cpu_hog io_pulse
 

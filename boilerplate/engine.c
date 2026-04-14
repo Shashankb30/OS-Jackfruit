@@ -493,10 +493,14 @@ int child_fn(void *arg)
     signal(SIGINT, forward_sig);
     signal(SIGTERM, forward_sig);
 
+    if (setpgid(0, 0) != 0) {
+        perror("setpgid");
+        return 1;
+    }
+
     // Fork because PID 1 ignores SIGTERM
     pid_t pid = fork();
     if (pid == 0) {
-        setpgid(0, 0);
         execl("/bin/sh", "sh", "-c", args->command, NULL);
         perror("execl");
         exit(1);
@@ -596,7 +600,7 @@ void *capture_container_log(void *arg) {
         }
 
         if (fds[0].revents & (POLLIN | POLLHUP)) {
-            int rc = kill(container->host_pid, SIGKILL);
+            int rc = kill(-(container->host_pid), SIGKILL);
             if (rc == -1) {
                 perror("kill");
             }
@@ -631,11 +635,13 @@ void *capture_container_log(void *arg) {
                     container->state = CONTAINER_KILLED;
                     printf("Container '%s' was killed by signal %d\n", container->id, container->exit_code);
                 }
-            } else {
+            } else if (exit_code == -1) {
                 fprintf(stderr, "Container '%s' is in unknown state: %d\n", container->id, status);
                 container->exit_code = -1;
                 container->state = CONTAINER_STOPPED;
             }
+
+            unregister_from_monitor(args->ctx->monitor_fd, container->id, container->host_pid);
 
             int should_destroy = 0;
             pthread_mutex_lock(&container->stream_lock);
@@ -666,6 +672,8 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
     strncpy(container->rootfs, request->rootfs, PATH_MAX);
     strncpy(container->command, request->command, CHILD_COMMAND_LEN);
     container->nice_value = request->nice_value;
+    container->soft_limit_bytes = request->soft_limit_bytes;
+    container->hard_limit_bytes = request->hard_limit_bytes;
     container->state = CONTAINER_STARTING;
     container->stop_requested = 0;
 
@@ -788,12 +796,16 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
     if (pid > 0) {
         close(cout_fds[1]);
         close(cin_fds[0]);
-        printf("Started container %s with PID %d\n", container->id, pid);
         container->host_pid = pid;
         container->started_at = time(NULL);
         container->state = CONTAINER_RUNNING;
         if (container_out != NULL) {
             *container_out = container;
+        }
+        printf("Started container %s with PID %d\n", container->id, pid);
+        rc = register_with_monitor(ctx->monitor_fd, container->id, container->host_pid, container->soft_limit_bytes, container->hard_limit_bytes);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to register container '%s' with monitor\n", container->id);
         }
         return 0;
     }
@@ -914,7 +926,7 @@ int stop_container(container_record_t *container, int signal) {
     if (signal == SIGTERM) {
         container->stop_requested = 1;
     }
-    int rc = kill(container->host_pid, signal);
+    int rc = kill(-(container->host_pid), signal);
     if (rc == -1) {
         perror("kill");
     }
@@ -1188,7 +1200,7 @@ void stop_supervisor() {
  */
 static int run_supervisor(const char *rootfs)
 {
-    __label__ cleanup_bounded_buffer, cleanup_socket;
+    __label__ cleanup_bounded_buffer, cleanup_monitor, cleanup_socket;
     (void) rootfs;
 
     if (supervisor_ctx != NULL) {
@@ -1228,16 +1240,22 @@ static int run_supervisor(const char *rootfs)
      *   5) enter the supervisor event loop
      */
 
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd == -1) {
+        perror("open");
+        goto cleanup_bounded_buffer;
+    }
+
     rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
     if (rc != 0) {
         fprintf(stderr, "Failed to create logger thread. Error code: %d\n", rc);
-        goto cleanup_bounded_buffer;
+        goto cleanup_monitor;
     }
 
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ctx.server_fd == -1) {
         perror("socket");
-        goto cleanup_bounded_buffer;
+        goto cleanup_monitor;
     }
 
     struct sockaddr_un addr;
@@ -1316,6 +1334,9 @@ static int run_supervisor(const char *rootfs)
 cleanup_socket:
     close(ctx.server_fd);
     unlink(CONTROL_PATH);
+
+cleanup_monitor:
+    close(ctx.monitor_fd);
 
 cleanup_bounded_buffer:
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
