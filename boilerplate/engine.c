@@ -899,9 +899,16 @@ void get_containers_status(supervisor_ctx_t *ctx, char *buf, int n) {
         while (container != NULL && len < n) {
             container_state_t state = container->state;
             const char *state_str = state_to_string(state);
-            len += snprintf(buf + len, n - len, "%s (%s) - Start Time: %lu", container->id, state_str, container->started_at);
+            len += snprintf(buf + len, n - len, "%s (%s)", container->id, state_str);
+            if (state != CONTAINER_STARTING) {
+                char time_str[32];
+                struct tm t;
+                localtime_r(&container->started_at, &t);
+                strftime(time_str, sizeof(time_str), "%d-%m-%Y %H:%M:%S", &t);
+                len += snprintf(buf + len, n - len, " - Start Time: %s", time_str);
+            }
             if (state == CONTAINER_RUNNING) {
-                len += snprintf(buf + len, n - len, ", PID: %d, Nice: %d", container->host_pid, container->nice_value);
+                len += snprintf(buf + len, n - len, ", PID: %d, Nice: %d, Soft Limit: %lu, Hard Limit: %lu", container->host_pid, container->nice_value, container->soft_limit_bytes, container->hard_limit_bytes);
             } else if (state == CONTAINER_EXITED) {
                 len += snprintf(buf + len, n - len, ", Exit Code: %d", container->exit_code);
             } else if (state == CONTAINER_STOPPED) {
