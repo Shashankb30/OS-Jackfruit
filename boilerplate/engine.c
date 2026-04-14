@@ -77,7 +77,6 @@ typedef struct container_record {
     unsigned long soft_limit_bytes;
     unsigned long hard_limit_bytes;
     int exit_code;
-    int exit_signal;
     int stop_requested;
 
     void *stack_ptr;
@@ -138,6 +137,7 @@ typedef struct {
     union {
         int payload_len;
         int control_signal;
+        int exit_signal;
     } info;
 } streaming_chunk_t;
 
@@ -496,7 +496,7 @@ int child_fn(void *arg)
         return 1;
     }
 
-    signal(SIGINT, forward_sig);
+    signal(SIGINT, SIG_IGN);
     signal(SIGTERM, forward_sig);
 
     if (setpgid(0, 0) != 0) {
@@ -1037,16 +1037,40 @@ int stream_container_stdio(pthread_mutex_t *lock, container_record_t *container,
             break;
         }
 
-        if ((pollfds[0].revents & POLLHUP) || (pollfds[1].revents & POLLHUP)) {
+        int container_hup = pollfds[0].revents & POLLHUP;
+        int client_hup = pollfds[1].revents & POLLHUP;
+        if (container_hup || client_hup) {
             pthread_mutex_lock(&container->stream_lock);
             container->should_stream = 0;
-            if (!(pollfds[0].revents & POLLHUP)) {
+            if (!container_hup) {
                 close(container->streamfds[0]);
             }
             close(container->streamfds[1]);
             pthread_mutex_unlock(&container->stream_lock);
             pthread_mutex_destroy(&container->stream_lock);
             container->stream_lock_initialized = 0;
+
+            if (container_hup && !client_hup) {
+                container_state_t state = CONTAINER_RUNNING;
+                while (state == CONTAINER_RUNNING) {
+                    pthread_mutex_lock(lock);
+                    state = container->state;
+                    pthread_mutex_unlock(lock);
+                    if (state == CONTAINER_RUNNING) usleep(10000);
+                }
+
+                pthread_mutex_lock(lock);
+                chunk.is_control = 1;
+                chunk.info.exit_signal = container->exit_code;
+                if (container->state != CONTAINER_EXITED) chunk.info.exit_signal += 128;
+                pthread_mutex_unlock(lock);
+
+                rc = write(client_fd, &chunk, sizeof(chunk));
+                if (rc == -1) {
+                    perror("write");
+                }
+            }
+
             return 0;
         }
 
@@ -1057,7 +1081,15 @@ int stream_container_stdio(pthread_mutex_t *lock, container_record_t *container,
                 break;
             }
 
-            rc = write(client_fd, buf, rc);
+            chunk.is_control = 0;
+            chunk.info.payload_len = rc;
+            rc = write(client_fd, &chunk, sizeof(chunk));
+            if (rc == -1) {
+                perror("write");
+                break;
+            }
+
+            rc = write(client_fd, buf, chunk.info.payload_len);
             if (rc == -1) {
                 perror("write");
                 break;
@@ -1548,10 +1580,6 @@ static int cmd_run(int argc, char *argv[])
             break;
         }
 
-        if ((pollfds[0].revents & POLLHUP) || (pollfds[1].revents & POLLHUP)) {
-            break;
-        }
-
         if (pollfds[0].revents & POLLIN) {
             rc = read(STDIN_FILENO, buf, sizeof(buf));
             if (rc == -1) {
@@ -1575,19 +1603,38 @@ static int cmd_run(int argc, char *argv[])
         }
 
         if (pollfds[1].revents & POLLIN) {
-            rc = read(server_fd, buf, sizeof(buf));
+            rc = read(server_fd, &chunk, sizeof(chunk));
             if (rc == -1) {
                 perror("read");
                 break;
             }
 
-            rc = write(STDOUT_FILENO, buf, rc);
-            if (rc == -1) {
-                perror("write");
+            if (chunk.is_control) {
+                printf("\nContainer exited with code %d\n", chunk.info.exit_signal);
                 break;
             }
 
+            while (chunk.info.payload_len) {
+                size_t read_len = ((size_t) chunk.info.payload_len) > sizeof(buf) ? sizeof(buf) : ((size_t) chunk.info.payload_len);
+                rc = read(server_fd, buf, read_len);
+                if (rc == -1) {
+                    perror("read");
+                    break;
+                }
+                rc = write(STDOUT_FILENO, buf, rc);
+                if (rc == -1) {
+                    perror("write");
+                    break;
+                }
+                chunk.info.payload_len -= read_len;
+            }
+
             fflush(stdout);
+            if (rc == -1) break;
+        }
+
+        if ((pollfds[0].revents & POLLHUP) || (pollfds[1].revents & POLLHUP)) {
+            break;
         }
     }
 

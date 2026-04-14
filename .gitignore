@@ -5,6 +5,7 @@ boilerplate/engine
 boilerplate/memory_hog
 boilerplate/cpu_hog
 boilerplate/io_pulse
+boilerplate/sigint
 
 # Kernel module build artifacts
 *.ko

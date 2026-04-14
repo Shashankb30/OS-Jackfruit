@@ -7,7 +7,7 @@ PWD := $(shell pwd)
 # toolchain supports it.
 WORKLOAD_LDFLAGS = -static
 
-USER_TARGETS := engine memory_hog cpu_hog io_pulse
+USER_TARGETS := engine memory_hog cpu_hog io_pulse sigint
 
 all: $(USER_TARGETS) module
 
@@ -27,6 +27,9 @@ cpu_hog: cpu_hog.c
 
 io_pulse: io_pulse.c
 	gcc -O2 -Wall $(WORKLOAD_LDFLAGS) -o io_pulse io_pulse.c
+
+sigint: sigint.c
+	gcc -O2 -Wall $(WORKLOAD_LDFLAGS) -o sigint sigint.c
 
 monitor.ko: monitor.c monitor_ioctl.h
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
