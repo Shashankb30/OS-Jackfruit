@@ -143,6 +143,22 @@ static void kill_process(const char *container_id,
            container_id, pid, rss_bytes, limit_bytes);
 }
 
+static void accumulate_rss_recursive(struct task_struct *task, long *rss)
+{
+    struct mm_struct *mm;
+    struct task_struct *child;
+
+    mm = get_task_mm(task);
+    if (mm) {
+        *rss += get_mm_rss(mm) * PAGE_SIZE;
+        mmput(mm);
+    }
+
+    list_for_each_entry(child, &task->children, sibling) {
+        accumulate_rss_recursive(child, rss);
+    }
+}
+
 /* ---------------------------------------------------------------
  * Timer Callback - fires every CHECK_INTERVAL_SEC seconds.
  * --------------------------------------------------------------- */
@@ -168,23 +184,21 @@ static void timer_callback(struct timer_list *t)
         struct task_struct *task;
 
         rcu_read_lock();
-        for_each_process(task) {
-            if (task_pgrp_nr(task) == entry->pid) {
-                struct mm_struct *mm = get_task_mm(task);
-                if (mm) {
-                    rss += get_mm_rss(mm) * PAGE_SIZE;
-                    mmput(mm);
-                }
-            }
-        }
-        rcu_read_unlock();
 
-        // Process exited
-        if (rss < 0) {
+        task = pid_task(find_vpid(entry->pid), PIDTYPE_PID);
+        if (!task) {
+            rcu_read_unlock();
             list_del(&entry->list);
             kfree(entry);
             continue;
         }
+
+        get_task_struct(task);
+
+        accumulate_rss_recursive(task, &rss);
+
+        put_task_struct(task);
+        rcu_read_unlock();
 
         // Soft limit
         if (!entry->soft_limit_triggered && rss > entry->soft_limit_bytes) {
