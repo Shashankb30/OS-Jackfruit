@@ -45,7 +45,7 @@
 #define CONTAINER_ID_LEN 32
 #define CONTROL_PATH "/tmp/mini_runtime.sock"
 #define LOG_DIR "logs"
-#define CONTROL_MESSAGE_LEN 256
+#define CONTROL_MESSAGE_LEN 2048
 #define CHILD_COMMAND_LEN 256
 #define LOG_CHUNK_SIZE 4096
 #define LOG_BUFFER_CAPACITY 16
@@ -142,6 +142,7 @@ typedef struct {
 } streaming_chunk_t;
 
 typedef struct {
+    char rootfs_base[PATH_MAX];
     int server_fd;
     int monitor_fd;
     int shutdown_pipe_fds[2]; // used as a shutdown signal
@@ -714,6 +715,22 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
     }
     container->container_out_fd = cout_fds[0];
 
+    struct stat st = {0};
+    // Check if container->rootfs exists and is a directory
+    if (stat(container->rootfs, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        int cmd_size = 2 * PATH_MAX + 32;
+        char *cmd = malloc(cmd_size);
+        snprintf(cmd, cmd_size, "cp -a \"%s\" \"%s\"", ctx->rootfs_base, container->rootfs);
+
+        int ret = system(cmd);
+        free(cmd);
+        if (ret != 0) {
+            fprintf(stderr, "Failed to copy rootfs from %s to %s\n", ctx->rootfs_base, container->rootfs);
+            free(container);
+            return -1;
+        }
+    }
+
     int cin_fds[2] = {-1};
     rc = pipe(cin_fds);
     if (rc != 0) {
@@ -771,7 +788,6 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
     pthread_mutex_unlock(&ctx->metadata_lock);
 
     // Create log directory if required
-    struct stat st = {0};
     rc = stat(LOG_DIR, &st);
     if (rc == -1) {
         rc = mkdir(LOG_DIR, 0755);
@@ -1293,7 +1309,6 @@ void stop_supervisor() {
 static int run_supervisor(const char *rootfs)
 {
     __label__ cleanup_bounded_buffer, cleanup_monitor, cleanup_socket;
-    (void) rootfs;
 
     if (supervisor_ctx != NULL) {
         fprintf(stderr, "run_supervisor has been called more than once\n");
@@ -1307,6 +1322,8 @@ static int run_supervisor(const char *rootfs)
     memset(&ctx, 0, sizeof(ctx));
     ctx.server_fd = -1;
     ctx.monitor_fd = -1;
+    strncpy(ctx.rootfs_base, rootfs, sizeof(ctx.rootfs_base));
+    ctx.rootfs_base[sizeof(ctx.rootfs_base) - 1] = '\0';
 
     rc = pthread_mutex_init(&ctx.metadata_lock, NULL);
     if (rc != 0) {
