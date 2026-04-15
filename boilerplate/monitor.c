@@ -135,7 +135,7 @@ static void kill_process(const char *container_id,
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
     if (task)
-        send_sig(SIGKILL, task, 1);
+        kill_pid(task_pgrp(task), SIGKILL, 1);
     rcu_read_unlock();
 
     printk(KERN_WARNING
