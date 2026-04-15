@@ -92,6 +92,7 @@ typedef struct container_record {
     pthread_mutex_t stream_lock;
     int should_stream;
     int streamfds[2];
+    pthread_cond_t state_cv;
 
     int log_file_fd;
     char log_path[PATH_MAX];
@@ -621,64 +622,26 @@ void *capture_container_log(void *arg) {
             pthread_mutex_unlock(&container->stream_lock);
         }
 
-        if (fds[0].revents & (POLLIN | POLLHUP)) {
-            int rc = kill(-(container->host_pid), SIGKILL);
-            if (rc == -1) {
-                perror("kill");
+        if (fds[0].revents & POLLIN) {
+            char buf[16];
+            int n = read(fds[0].fd, buf, sizeof(buf));
+
+            if (n > 0 && strncmp(buf, "stop", 4) == 0) {
+                int rc = kill(-(container->host_pid), SIGKILL);
+                if (rc == -1) {
+                    perror("kill");
+                }
+                break;
             }
-            break;
         }
 
         if (fds[1].revents & POLLHUP) {
-            int status;
-            pid_t rpid = waitpid(container->host_pid, &status, 0);
-            if (rpid < 0) {
-                perror("waitpid");
-                break;
-            }
-            free(container->stack_ptr);
-
-            pthread_mutex_lock(&args->ctx->metadata_lock);
-            int exit_code = -1;
-            if (WIFEXITED(status)) {
-                exit_code = WEXITSTATUS(status);
-                if (exit_code < 128) {
-                    container->exit_code = exit_code;
-                    container->state = CONTAINER_EXITED;
-                    printf("Container '%s' exited with code %d\n", container->id, container->exit_code);
-                }
-            }
-
-            if (WIFSIGNALED(status) || exit_code > 128) {
-                container->exit_code = exit_code > 128 ? exit_code - 128 : WTERMSIG(status);
-                if (container->stop_requested && container->exit_code != SIGKILL) {
-                    container->state = CONTAINER_STOPPED;
-                    printf("Container '%s' was stopped by signal %d\n", container->id, container->exit_code);
-                } else {
-                    container->state = CONTAINER_KILLED;
-                    printf("Container '%s' was killed by signal %d\n", container->id, container->exit_code);
-                }
-            } else if (exit_code == -1) {
-                fprintf(stderr, "Container '%s' is in unknown state: %d\n", container->id, status);
-                container->exit_code = -1;
-                container->state = CONTAINER_STOPPED;
-            }
-            pthread_mutex_unlock(&args->ctx->metadata_lock);
-
-            unregister_from_monitor(args->ctx->monitor_fd, container->id, container->host_pid);
-
-            int should_destroy = 0;
+            // container exited, supervisor will reap via SIGCHLD
             pthread_mutex_lock(&container->stream_lock);
             if (container->should_stream) {
                 close(container->streamfds[1]);
-            } else {
-                should_destroy = 1;
             }
             pthread_mutex_unlock(&container->stream_lock);
-            if (should_destroy) {
-                pthread_mutex_destroy(&container->stream_lock);
-                container->stream_lock_initialized = 0;
-            }
             break;
         }
     }
@@ -749,6 +712,7 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
         return -1;
     }
     container->stream_lock_initialized = 1;
+    pthread_cond_init(&container->state_cv, NULL);
 
     pthread_mutex_lock(&ctx->metadata_lock);
     container_record_t *tmp = ctx->containers;
@@ -771,6 +735,7 @@ int start_container(supervisor_ctx_t *ctx, control_request_t *request, container
                     rc = 1;
                     goto cleanup_pipe;
                 }
+                pthread_cond_destroy(&tmp->state_cv);
                 if (prev != NULL) {
                     prev->next = tmp->next;
                 } else {
@@ -1074,15 +1039,11 @@ int stream_container_stdio(pthread_mutex_t *lock, container_record_t *container,
             container->stream_lock_initialized = 0;
 
             if (container_hup && !client_hup) {
-                container_state_t state = CONTAINER_RUNNING;
-                while (state == CONTAINER_RUNNING) {
-                    pthread_mutex_lock(lock);
-                    state = container->state;
-                    pthread_mutex_unlock(lock);
-                    if (state == CONTAINER_RUNNING) usleep(10000);
+                pthread_mutex_lock(lock);
+                while (container->state == CONTAINER_RUNNING) {
+                    pthread_cond_wait(&container->state_cv, lock);
                 }
 
-                pthread_mutex_lock(lock);
                 chunk.is_control = 1;
                 chunk.info.exit_signal = container->exit_code;
                 if (container->state != CONTAINER_EXITED) chunk.info.exit_signal += 128;
@@ -1287,6 +1248,87 @@ void *handle_client(void *arg) {
     return NULL;
 }
 
+void handle_sigchld(int sig) {
+    (void) sig;
+
+    char c = 'c';
+    if (supervisor_ctx) {
+        if (write(supervisor_ctx->shutdown_pipe_fds[1], &c, 1) == -1) {
+            perror("write");
+        }
+    }
+}
+
+void reap_children(supervisor_ctx_t *ctx)
+{
+    while (1) {
+        int status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+
+        if (pid <= 0) break;
+
+        pthread_mutex_lock(&ctx->metadata_lock);
+
+        container_record_t *container = ctx->containers;
+        while (container) {
+            if (container->host_pid == pid) {
+                int exit_code = -1;
+
+                if (WIFEXITED(status)) {
+                    exit_code = WEXITSTATUS(status);
+                    if (exit_code < 128) {
+                        container->exit_code = exit_code;
+                        container->state = CONTAINER_EXITED;
+                        printf("Container '%s' exited with code %d\n", container->id, container->exit_code);
+                    }
+                }
+
+                if (WIFSIGNALED(status) || exit_code > 128) {
+                    container->exit_code = exit_code > 128 ? exit_code - 128 : WTERMSIG(status);
+
+                    if (container->stop_requested && container->exit_code != SIGKILL) {
+                        container->state = CONTAINER_STOPPED;
+                        printf("Container '%s' was stopped by signal %d\n", container->id, container->exit_code);
+                    } else {
+                        container->state = CONTAINER_KILLED;
+                        printf("Container '%s' was killed by signal %d\n", container->id, container->exit_code);
+                    }
+                } else if (exit_code == -1) {
+                    fprintf(stderr, "Container '%s' is in unknown state: %d\n", container->id, status);
+                    container->exit_code = -1;
+                    container->state = CONTAINER_STOPPED;
+                }
+
+                pthread_cond_broadcast(&container->state_cv);
+
+                unregister_from_monitor(ctx->monitor_fd, container->id, container->host_pid);
+
+                free(container->stack_ptr);
+                container->stack_ptr = NULL;
+
+                int should_destroy = 0;
+                pthread_mutex_lock(&container->stream_lock);
+                if (container->should_stream) {
+                    close(container->streamfds[1]);
+                } else {
+                    should_destroy = 1;
+                }
+                pthread_mutex_unlock(&container->stream_lock);
+
+                if (should_destroy) {
+                    pthread_mutex_destroy(&container->stream_lock);
+                    container->stream_lock_initialized = 0;
+                }
+
+                break;
+            }
+            container = container->next;
+        }
+
+        pthread_mutex_unlock(&ctx->metadata_lock);
+    }
+}
+
 void stop_supervisor() {
     if (supervisor_ctx == NULL) return;
     int rc = write(supervisor_ctx->shutdown_pipe_fds[1], "stop", 5);
@@ -1392,6 +1434,7 @@ static int run_supervisor(const char *rootfs)
 
     signal(SIGINT, stop_supervisor);
     signal(SIGTERM, stop_supervisor);
+    signal(SIGCHLD, handle_sigchld);
 
     struct pollfd pollfds[2];
     pollfds[0].fd = ctx.shutdown_pipe_fds[0];
@@ -1409,7 +1452,20 @@ static int run_supervisor(const char *rootfs)
         }
 
         if (pollfds[0].revents & POLLIN) {
-            break;
+            // Check if it was shutdown signal or SIGCHLD
+            char buf[32];
+            if (read(ctx.shutdown_pipe_fds[0], buf, sizeof(buf)) == -1) {
+                perror("read");
+                break;
+            }
+
+            if (buf[0] == 'c') {
+                reap_children(&ctx);
+            } else if (strncmp(buf, "stop", 4) == 0) {
+                break;
+            }
+
+            continue;
         }
 
         if (!(pollfds[1].revents & POLLIN)) {
